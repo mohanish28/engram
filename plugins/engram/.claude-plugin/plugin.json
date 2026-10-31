@@ -1,0 +1,8 @@
+{
+  "name": "engram",
+  "version": "0.2.0",
+  "description": "Persistent memory for Claude Code: notes written during work, injected at session start, consolidated and decayed over time.",
+  "author": { "name": "Odin" },
+  "license": "MIT",
+  "keywords": ["memory", "persistence", "consolidation", "agents"]
+}

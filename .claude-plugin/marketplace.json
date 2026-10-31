@@ -1,0 +1,14 @@
+{
+  "name": "engram-marketplace",
+  "owner": { "name": "Odin" },
+  "metadata": { "description": "Memory layer plugins for Claude Code" },
+  "plugins": [
+    {
+      "name": "engram",
+      "source": "./plugins/engram",
+      "description": "Persistent memory for Claude Code: write during work, recall at session start, consolidate and forget over time.",
+      "version": "0.2.0",
+      "keywords": ["memory", "persistence", "consolidation"]
+    }
+  ]
+}

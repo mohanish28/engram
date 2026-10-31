@@ -853,3 +853,138 @@ class ScanGit(Base):
         p = self.cli("scan-git", self.repo)
         self.assertEqual(p.returncode, 0)
         self.assertIn("0 new", p.out)
+
+
+class Injections(Base):
+    def rows(self):
+        return self.sql("SELECT session_id, hook, chars, note_keys FROM injections ORDER BY id")
+
+    def test_session_start_is_logged(self):
+        i = self.saved_id(self.add("alpha note"))
+        out = self.hook("hook-start", session_id="sess1").out
+        (sid, hook, chars, keys), = self.rows()
+        self.assertEqual((sid, hook), ("sess1", "hook-start"))
+        self.assertEqual(chars, len(out))
+        pid = self.sql("SELECT project_id FROM memories WHERE id=?", i)[0][0]
+        self.assertEqual(json.loads(keys), ["%d:%d" % (pid, i)])
+
+    def test_prompt_hook_is_logged_only_when_it_injects(self):
+        self.add("zebra note")
+        self.hook("hook-prompt", prompt="unrelated bread", session_id="s")
+        self.assertEqual(self.rows(), [])
+        out = self.hook("hook-prompt", prompt="zebra", session_id="s").out
+        self.assertEqual(self.rows()[0][1:3], ("hook-prompt", len(out)))
+
+    def test_note_text_is_never_logged(self):
+        self.add("zebraprivatemarker note")
+        self.hook("hook-start", session_id="s")
+        self.hook("hook-prompt", prompt="zebraprivatemarker", session_id="s")
+        cols = [r[1] for r in self.sql("PRAGMA table_info(injections)")]
+        self.assertCountEqual(cols, ["id", "session_id", "hook", "chars", "note_keys", "ts"])
+        for row in self.sql("SELECT * FROM injections"):
+            self.assertNotIn("zebraprivatemarker", " ".join(str(x) for x in row))
+
+    def test_stats_reports_per_hook_and_per_session(self):
+        self.add("zebra note")
+        a = self.hook("hook-start", session_id="sess1").out
+        b = self.hook("hook-prompt", prompt="zebra", session_id="sess1").out
+        c = self.hook("hook-start", session_id="sess2").out
+        out = self.cli("stats").out
+        self.assertRegex(out, r"hook-start\s+2\s+%d" % (len(a) + len(c)))
+        self.assertRegex(out, r"hook-prompt\s+1\s+%d" % len(b))
+        self.assertRegex(out, r"sess1\s+2\s+%d" % (len(a) + len(b)))
+        self.assertRegex(out, r"sess2\s+1\s+%d" % len(c))
+
+    def long_notes(self, n=6):
+        for i in range(n):
+            self.add("--importance", "5", ("zebra rollout word%d " % i) + "long text " * 45)
+
+    def test_default_session_start_cap(self):
+        self.long_notes()
+        out = self.hook("hook-start").out
+        self.assertLessEqual(len(out), 1500)
+        self.assertEqual(self.rows()[0][2], len(out))
+        self.assertTrue([x for x in out.splitlines() if NOTE_LINE.match(x)])
+
+    def test_default_prompt_cap(self):
+        self.long_notes()
+        out = self.hook("hook-prompt", prompt="zebra rollout").out
+        self.assertLessEqual(len(out), 900)
+        self.assertTrue([x for x in out.splitlines() if NOTE_LINE.match(x)])
+
+    def test_caps_are_configurable(self):
+        self.long_notes()
+        self.env.update(ENGRAM_CAP_SESSION_START="400", ENGRAM_CAP_PROMPT="1400")
+        self.assertLessEqual(len(self.hook("hook-start").out), 400)
+        lines = self.hook("hook-prompt", prompt="zebra rollout").out.splitlines()
+        self.assertEqual(len([x for x in lines if NOTE_LINE.match(x)]), 2)
+
+    def test_notes_are_dropped_whole_never_cut(self):
+        self.long_notes()
+        for line in self.hook("hook-prompt", prompt="zebra rollout").out.splitlines():
+            if NOTE_LINE.match(line):
+                self.assertTrue(line.endswith("long text"), line[-20:])
+
+    def test_bad_cap_value_falls_back_to_default(self):
+        self.long_notes()
+        self.env["ENGRAM_CAP_PROMPT"] = "lots"
+        self.assertLessEqual(len(self.hook("hook-prompt", prompt="zebra rollout").out), 900)
+
+
+class FastIdentity(Base):
+    """Project identity is read from .git directly, so hooks need not start git."""
+    def env_without_git(self):
+        return dict(self.env, PATH="")
+
+    def repo(self, *parts, remote=None):
+        d = self.tmp.joinpath(*parts)
+        d.mkdir(parents=True)
+        subprocess.run(["git", "-C", str(d), "init", "-q"], check=True, capture_output=True)
+        if remote:
+            subprocess.run(["git", "-C", str(d), "remote", "add", "origin", remote],
+                           check=True, capture_output=True)
+        return d
+
+    def test_remote_is_read_without_the_git_binary(self):
+        a = self.repo("a", "one", remote="git@github.com:acme/thing.git")
+        self.add("shared note", cwd=a)
+        (a / "sub").mkdir()
+        p = self.cli("hook-start", stdin=json.dumps({"cwd": str(a / "sub")}), env=self.env_without_git())
+        self.assertIn("shared note", p.out)
+        self.assertEqual(self.sql("SELECT locator FROM projects WHERE id<>0")[0][0], "github.com/acme/thing")
+
+    def test_worktree_shares_notes_through_the_git_fallback(self):
+        a = self.repo("a", "main", remote="git@github.com:acme/thing.git")
+        subprocess.run(["git", "-C", str(a), "-c", "user.name=t", "-c", "user.email=t@example.com",
+                        "commit", "-q", "--allow-empty", "-m", "x"], check=True, capture_output=True)
+        wt = self.tmp / "wt"
+        subprocess.run(["git", "-C", str(a), "worktree", "add", "-q", str(wt)], check=True, capture_output=True)
+        self.add("worktree shared note", cwd=a)
+        self.assertIn("worktree shared note", self.hook("hook-start", cwd=wt).out)
+
+    def test_other_remote_name_is_ignored(self):
+        a = self.repo("a", "one")
+        subprocess.run(["git", "-C", str(a), "remote", "add", "upstream", "git@github.com:x/y.git"],
+                       check=True, capture_output=True)
+        self.add("note", cwd=a)
+        self.assertNotIn("x/y", self.sql("SELECT locator FROM projects WHERE id<>0")[0][0])
+
+
+@unittest.skipUnless(SH, "sh not available")
+class LauncherOrder(Base):
+    def first_interpreter(self, os_name):
+        d = self.tmp / "bin"
+        d.mkdir(exist_ok=True)
+        for name in ("python3", "python"):
+            with open(d / name, "w", newline="\n") as f:
+                f.write("#!/bin/sh\necho %s\n" % name)
+            os.chmod(d / name, 0o755)
+        env = dict(self.env, PATH=str(d), OS=os_name)
+        p = subprocess.run([SH, str(LAUNCHER), "stats"], capture_output=True, env=env, timeout=30)
+        return p.stdout.decode().strip()
+
+    def test_windows_tries_python_first(self):
+        self.assertEqual(self.first_interpreter("Windows_NT"), "python")
+
+    def test_other_systems_try_python3_first(self):
+        self.assertEqual(self.first_interpreter(""), "python3")

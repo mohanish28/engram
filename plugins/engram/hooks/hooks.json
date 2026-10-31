@@ -1,5 +1,5 @@
 {
-  "description": "engram: load top notes at session start, add notes matching each prompt, log an episode and prune at session end",
+  "description": "engram: load a topic index and top notes at session start, add notes matching each prompt, log a session summary at session end",
   "hooks": {
     "SessionStart": [
       {

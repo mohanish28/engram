@@ -21,16 +21,18 @@ Save at the moment something is settled, not at the end. One line each, with the
 | `fact` | A stable project fact is learned | "Deploys go through staging branch only" |
 | `question` | Something is open and unresolved | "Unclear whether rate limit is per key or per IP" |
 
-Importance 1-5: use 4-5 only for things that would cause real damage or rework if forgotten.
+Importance 1-5: use 4-5 only for things that would cause real damage or rework if forgotten. Decisions and failures at 4+, and any note at 5, stay in the hot tier; other notes go cold after 30 days unused, and then load only when a prompt clearly matches or you search.
+
+Tag each note with `--topic`, reusing a topic from the `[engram] Topics:` line where one fits. If saving prints a `TOPIC` line, follow it when the suggested topic means the same thing.
 
 ```
-sh "$ENGRAM_CLI" add --kind decision --importance 4 "Chose X over Y because Z"
+sh "$ENGRAM_CLI" add --kind decision --importance 4 --topic database "Chose X over Y because Z"
 sh "$ENGRAM_CLI" add --global --kind preference "Prefers concise answers"
 ```
 
 ## When not to save
 
-- Secrets, tokens, passwords, personal data. The CLI redacts obvious ones, but do not rely on it.
+- Secrets, tokens, passwords, personal data. The CLI refuses likely secrets with `refused` and saves nothing: remove the value and retry, without repeating it to the user. It cannot catch everything.
 - Anything derivable from the code or git history.
 - Step-by-step logs of what you did. Session episodes are captured automatically.
 - Guesses. Only save what was confirmed or decided.
@@ -58,6 +60,8 @@ When the user refers to earlier work ("the thing we decided", "why did we skip X
 ```
 sh "$ENGRAM_CLI" search "rate limit"
 ```
+
+Search covers this project's hot and cold notes plus global notes. `--everywhere` adds shared projects. Use `--project NAME` for a private project only when the user names it. `recent` lists recent work.
 
 ## Consolidating
 

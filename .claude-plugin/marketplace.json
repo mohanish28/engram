@@ -7,7 +7,7 @@
       "name": "engram",
       "source": "./plugins/engram",
       "description": "Persistent memory for Claude Code: write during work, recall at session start, consolidate and forget over time.",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "keywords": ["memory", "persistence", "consolidation"]
     }
   ]

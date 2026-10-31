@@ -8,6 +8,6 @@ Consolidate engram memory for this project. Work from the data, do not invent no
 2. Episodes: for each one that records something durable (a decision, a ruled-out approach, a preference), save it as its own note with `add`. Skip episodes that are just activity.
 3. Duplicates: merge with `sh "$ENGRAM_CLI" merge ID1 ID2 --text "<combined note>"`.
 4. Conflicts: keep the newer or better-supported one. Replace the other with `supersede ID "<corrected note>"`. If you cannot tell which is right, ask the user rather than guessing.
-5. Stale or wrong: `sh "$ENGRAM_CLI" forget ID`.
+5. Wrong: `sh "$ENGRAM_CLI" forget ID`. Stale notes need nothing: they go cold on their own.
 6. Run `sh "$ENGRAM_CLI" prune`.
 7. Report in 3-4 lines: what was merged, promoted, superseded, archived.

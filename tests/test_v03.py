@@ -988,3 +988,18 @@ class LauncherOrder(Base):
 
     def test_other_systems_try_python3_first(self):
         self.assertEqual(self.first_interpreter(""), "python3")
+
+
+@unittest.skipUnless(SH, "sh not available")
+class LauncherImportPath(Base):
+    def test_module_in_current_folder_is_not_imported(self):
+        marker = self.tmp / "hijacked"
+        for name in ("json", "re", "sqlite3", "engram"):
+            (self.cwd / (name + ".py")).write_text(
+                "open(%r, 'w').close()\n" % str(marker), encoding="utf-8")
+        for args in (["stats"], ["add", "alpha note"], ["hook-start"]):
+            with self.subTest(args=args):
+                p = subprocess.run([SH, str(LAUNCHER)] + args, input=b"{}", capture_output=True,
+                                   cwd=str(self.cwd), env=self.env, timeout=60)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertFalse(marker.exists(), "module from cwd was executed")

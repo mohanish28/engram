@@ -11,7 +11,9 @@ case "$1" in
   # Hooks use only the standard library, and must stay silent.
   hook-*) flags="-I -S"; exec 2>/dev/null ;;
 esac
+# python -c puts the current folder on the import path; a repo's json.py must not run.
 boot='import sys
+sys.path[:] = [p for p in sys.path if p not in ("", ".")]
 if sys.version_info < (3, 8): sys.exit(9)
 sys.path.insert(0, sys.argv.pop(1))
 import engram

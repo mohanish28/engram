@@ -631,3 +631,121 @@ class Cascade(Base):
         out = self.prompt()
         self.assertIn("#%d" % i, out)
         self.assertNotIn("ghp_abcdef", out)
+
+
+class Vectors(Base):
+    def setUp(self):
+        super().setUp()
+        self.trace = self.tmp / "embedded.txt"
+        self.env.update(ENGRAM_EMBEDDER="stub", ENGRAM_EMBED_TRACE=str(self.trace))
+
+    def traced(self):
+        return self.trace.read_text(encoding="utf-8") if self.trace.exists() else ""
+
+    def vectors(self):
+        return self.sql("SELECT COUNT(*) FROM card_vectors")[0][0]
+
+    def test_index_vectors_embeds_cards_only(self):
+        self.add("--topic", "storage", "Databank backups run nightly. " + "Extra detail sentence here.")
+        self.assertIn("indexed 1", self.cli("index-vectors").out)
+        self.assertEqual(self.vectors(), 1)
+        self.assertIn("Databank backups run nightly.", self.traced())
+        self.assertNotIn("Extra detail sentence", self.traced().split("|", 1)[1] if "|" in self.traced() else "")
+
+    def test_saving_does_not_embed(self):
+        self.add("alpha note")
+        self.assertEqual(self.traced(), "")
+
+    def test_index_vectors_skips_already_indexed_cards(self):
+        self.add("alpha note")
+        self.cli("index-vectors")
+        self.assertIn("indexed 0", self.cli("index-vectors").out)
+
+    def test_search_merges_and_labels_each_path(self):
+        vec = self.saved_id(self.add("databank backups nightly"))
+        both = self.saved_id(self.add("database backups nightly"))
+        self.cli("index-vectors")
+        lines = self.cli("search", "database").out.splitlines()
+        by_id = {int(re.match(r"#(\d+)", x).group(1)): x for x in lines}
+        self.assertIn("(via keyword+vector)", by_id[both])
+        self.assertIn("(via vector)", by_id[vec])
+
+    def test_keyword_only_hit_is_labelled_when_vectors_are_active(self):
+        i = self.saved_id(self.add("zebra"))
+        self.saved_id(self.add("other words"))
+        self.cli("index-vectors")
+        self.sql("DELETE FROM card_vectors WHERE note_id=?", i)
+        self.assertIn("(via keyword)", self.cli("search", "zebra").out)
+
+    def test_hooks_never_embed(self):
+        self.add("zebra migration rollout note")
+        self.cli("index-vectors")
+        self.trace.unlink()
+        self.hook("hook-start")
+        self.assertIn("zebra", self.hook("hook-prompt", prompt="zebra migration").out)
+        self.hook("hook-capture")
+        self.assertEqual(self.traced(), "")
+
+    def test_vector_results_respect_scopes(self):
+        other = self.tmp / "other"
+        other.mkdir()
+        self.add("databank private note", cwd=other)
+        self.cli("index-vectors")
+        self.cli("index-vectors")
+        self.assertNotIn("databank", self.cli("search", "--everywhere", "database").out)
+
+    def test_edit_invalidates_vector(self):
+        i = self.saved_id(self.add("alpha note"))
+        self.cli("index-vectors")
+        self.cli("edit", i, "--text", "bravo words")
+        self.assertEqual(self.vectors(), 0)
+        self.assertIn("indexed 1", self.cli("index-vectors").out)
+
+    def test_purge_removes_vector(self):
+        i = self.saved_id(self.add("alpha note"))
+        self.cli("index-vectors")
+        self.cli("purge", i)
+        self.assertEqual(self.vectors(), 0)
+
+    def test_forget_removes_vector(self):
+        i = self.saved_id(self.add("alpha note"))
+        self.cli("index-vectors")
+        self.cli("forget", i)
+        self.assertEqual(self.vectors(), 0)
+
+    def test_canaries_never_reach_the_embedder_or_vector_table(self):
+        i = self.saved_id(self.add("alpha note"))
+        for text in SECRETS:
+            with self.subTest(text=text[:10]):
+                self.sql("UPDATE memories SET text=? WHERE id=?", "planted " + text, i)
+                self.cli("edit", i, "--topic", "retagged")
+                self.cli("index-vectors")
+                for marker in MARKERS:
+                    self.assertNotIn(marker, self.traced())
+        cols = [r[1] for r in self.sql("PRAGMA table_info(card_vectors)")]
+        self.assertEqual(sorted(cols), ["model", "note_id", "vec"])
+
+
+class NoVectorExtras(Base):
+    def setUp(self):
+        super().setUp()
+        self.env["ENGRAM_EMBEDDER"] = "off"
+
+    def test_index_vectors_explains_and_succeeds(self):
+        self.add("alpha note")
+        p = self.cli("index-vectors")
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("keyword search only", p.out)
+
+    def test_search_is_plain_keyword(self):
+        self.add("zebra note")
+        p = self.cli("search", "zebra")
+        self.assertEqual((p.returncode, p.err), (0, ""))
+        self.assertNotIn("via", p.out)
+
+    def test_missing_packages_are_not_an_error(self):
+        self.env.pop("ENGRAM_EMBEDDER")
+        self.env["PYTHONPATH"] = ""
+        self.add("zebra note")
+        self.assertEqual(self.cli("search", "zebra").returncode, 0)
+        self.assertEqual(self.cli("index-vectors").returncode, 0)

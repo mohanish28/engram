@@ -15,6 +15,7 @@ import math
 import os
 import re
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -229,7 +230,20 @@ def migrate_projects_cards(c):
         write_card(c, r["id"])
 
 
-MIGRATIONS = [migrate_tiers, migrate_projects_cards]
+def migrate_vectors(c):
+    run_sql(c, """
+    CREATE TABLE card_vectors(
+      note_id INTEGER PRIMARY KEY,
+      model TEXT NOT NULL,
+      vec BLOB NOT NULL);
+    DROP TRIGGER card_ad;
+    CREATE TRIGGER card_ad AFTER DELETE ON cards BEGIN
+      DELETE FROM cards_fts WHERE rowid=old.note_id;
+      DELETE FROM card_vectors WHERE note_id=old.note_id; END;
+    """)
+
+
+MIGRATIONS = [migrate_tiers, migrate_projects_cards, migrate_vectors]
 
 
 # ---------- helpers ----------
@@ -636,6 +650,103 @@ def cmd_add(a):
               % (conflict["id"], i))
 
 
+# ---------- optional vectors: explicit search and index-vectors only, never a hook ----------
+MIN_SIMILARITY = 0.3
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def stub_embedder(texts):
+    """Test double: words sharing a 4-letter prefix land in the same bucket."""
+    import hashlib
+    trace = os.environ.get("ENGRAM_EMBED_TRACE")
+    if trace:
+        with open(trace, "a", encoding="utf-8") as f:
+            f.write("\n".join(texts) + "\n")
+    vectors = []
+    for text in texts:
+        v = [0.0] * 64
+        for w in split_words(text.lower()):
+            v[hashlib.md5(w[:4].encode("utf-8")).digest()[0] % 64] += 1.0
+        vectors.append(v)
+    return vectors
+
+
+def load_embedder():
+    """(embed function, model name), or None when the optional extras are missing."""
+    choice = os.environ.get("ENGRAM_EMBEDDER", "")
+    if choice == "stub":
+        return stub_embedder, "stub"
+    if choice == "off":
+        return None
+    try:
+        import sqlite_vec  # noqa: F401
+        from fastembed import TextEmbedding
+        model = TextEmbedding(EMBED_MODEL)
+    except Exception:
+        return None
+    return (lambda texts: [list(map(float, v)) for v in model.embed(texts)]), EMBED_MODEL
+
+
+def use_sqlite_vec(c):
+    try:
+        import sqlite_vec
+        c.enable_load_extension(True)
+        sqlite_vec.load(c)
+        c.enable_load_extension(False)
+        return True
+    except Exception:
+        return False
+
+
+def pack(v):
+    return struct.pack("%df" % len(v), *v)
+
+
+def cosine_distance(a, b):
+    a, b = struct.unpack("%df" % (len(a) // 4), a), struct.unpack("%df" % (len(b) // 4), b)
+    norm = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(x * x for x in b))
+    return 1 - sum(x * y for x, y in zip(a, b)) / norm if norm else 1.0
+
+
+def vector_hits(c, embedder, query, projects, limit):
+    """Note ids near query, among cards of the allowed projects, best first."""
+    embed, model = embedder
+    where = ("FROM card_vectors v JOIN cards ON cards.note_id=v.note_id WHERE v.model=? "
+             "AND cards.project_id IN (%s)" % ",".join("?" * len(projects)))
+    args = [model] + projects
+    if not c.execute("SELECT 1 " + where + " LIMIT 1", args).fetchone():
+        return []
+    q = pack(embed([query])[0])
+    if use_sqlite_vec(c):
+        rows = c.execute("SELECT v.note_id, vec_distance_cosine(v.vec, ?) d " + where +
+                         " ORDER BY d LIMIT ?", [q] + args + [limit]).fetchall()
+        scored = [(r["d"], r["note_id"]) for r in rows]
+    else:
+        # ponytail: brute force in Python, reached only by the stub embedder.
+        scored = sorted((cosine_distance(r["vec"], q), r["note_id"]) for r in
+                        c.execute("SELECT v.note_id, v.vec " + where, args).fetchall())[:limit]
+    return [i for d, i in scored if 1 - d >= MIN_SIMILARITY]
+
+
+def cmd_index_vectors(a):
+    embedder = load_embedder()
+    if not embedder:
+        emit("vector extras not installed (sqlite-vec, fastembed): keyword search only")
+        return
+    embed, model = embedder
+    c = db()
+    rows = c.execute("SELECT cards.note_id, cards.topic, cards.keywords, cards.gist FROM cards "
+                     "LEFT JOIN card_vectors v ON v.note_id=cards.note_id AND v.model=? "
+                     "WHERE v.note_id IS NULL", (model,)).fetchall()
+    if rows:
+        texts = ["%s | %s | %s" % (r["topic"], r["keywords"], r["gist"]) for r in rows]
+        for r, v in zip(rows, embed(texts)):
+            c.execute("INSERT OR REPLACE INTO card_vectors(note_id, model, vec) VALUES (?,?,?)",
+                      (r["note_id"], model, pack(v)))
+        c.commit()
+    emit("indexed %d cards with %s" % (len(rows), model))
+
+
 def cmd_search(a):
     c = db()
     if not fts_query(" ".join(a.query)):
@@ -647,6 +758,19 @@ def cmd_search(a):
     query = " ".join(a.query)
     terms = terms_of(query) or tokens(query)
     rows = matches(c, query, project, a.limit)
+    labels = {}
+    try:
+        embedder = load_embedder()
+        if embedder:
+            near = vector_hits(c, embedder, query, project, a.limit)
+            labels = {r["id"]: "keyword+vector" if r["id"] in near else "keyword" for r in rows}
+            known = set(labels)
+            for i in near:
+                if i not in known:
+                    labels[i] = "vector"
+                    rows.append(c.execute(NOTE_SELECT + " WHERE m.id=?", (i,)).fetchone())
+    except Exception:
+        labels = {}  # A broken optional extra must never break keyword search.
     now = time.time()
     for r in rows:
         # Only a real match counts as use; a stray shared word must not keep a note alive.
@@ -654,7 +778,7 @@ def cmd_search(a):
             c.execute("UPDATE memories SET access_count=access_count+1, last_access=? "
                       "WHERE id=?", (now, r["id"]))
             retier(c, r["id"])
-        emit(fmt(r))
+        emit(fmt(r) + ("  (via %s)" % labels[r["id"]] if r["id"] in labels else ""))
     c.commit()
     if not rows:
         emit("no matches")
@@ -1027,6 +1151,9 @@ def main():
 
     x = s.add_parser("stats")
     x.set_defaults(f=cmd_stats)
+
+    x = s.add_parser("index-vectors")
+    x.set_defaults(f=cmd_index_vectors)
 
     x = s.add_parser("hook-start")
     x.add_argument("--limit", type=int, default=3)

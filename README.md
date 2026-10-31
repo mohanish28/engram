@@ -73,7 +73,7 @@ CLI: `sh plugins/engram/scripts/engram.sh <command>`
 
 ## Secret handling
 
-- `scan()` checks known token formats, passwords in URLs, Bearer and Authorization values, `password is X`, `key: value` forms, and tokens of 20+ characters mixing letters and digits with high entropy. Full 40- and 64-character hex strings and UUIDs are exempt, so git SHAs stay usable.
+- `scan()` checks known token formats, passwords in URLs, Bearer and Authorization values, `password is X`, `key: value` forms, a password word such as `pass`, `pin` or `secret` followed within 3 words by a value containing a digit, and tokens of 20+ characters mixing letters and digits with high entropy. Full 40- and 64-character hex strings and UUIDs are exempt, so git SHAs stay usable.
 - `add`, `edit`, `supersede` and `merge` **refuse** a suspected secret, exit non-zero and store nothing. The message names the kind of secret, never its value.
 - Session logs and `scan-git` **redact** instead, because nobody is there to retry.
 - All command output goes through one `emit()` function that scans again, so old or hand-edited rows can't leak.
@@ -119,8 +119,8 @@ Windows 11, Python 3.12, through the real launcher, using `python tests/bench_ho
 - **Only run on Windows so far.** POSIX permission tests are skipped there, macOS and Linux are untested, and only Python 3.12 has been run.
 - **Entropy false positives.** Long camelCase names with a digit, and other random-looking IDs, can be refused. Reword the note, since there is no override.
 - **Entropy false negatives.** A hex secret of exactly 40 or 64 characters, or a secret shaped like a UUID, gets through.
-- **Prose false positives.** "password was reset" counts as a secret and is refused.
-- **Redaction has gaps.** Unknown token formats and passwords written in plain sentences can get through.
+- **Prose false positives.** This is deliberate, since a refusal only costs a retry. "password was reset", "tests pass on Windows 11" and "secret rotation every 90 days" are refused. Dotted versions such as `pin numpy to 1.26.4` are exempt.
+- **Redaction has gaps.** Unknown token formats can get through, and so can a digit-free password that doesn't directly follow "is" or "was", such as "ssh password hunter on box".
 - **Tag drift.** Topic suggestions are only suggestions, and matching is by spelling. `db` and `storage` are not linked, and a short tag can get an odd suggestion (`ui` and `utilities`).
 - **Scope mistakes.** Setting a project to `shared` exposes its notes to every other project's prompt hook, immediately. Same-named projects need their full locator from `scope list`. Moving a repo without a remote creates a new project.
 - **Keyword search only in hooks.** Paraphrases can miss. Single-character terms and `C#` aren't searchable, and common two-letter words such as "it" are ignored. Chinese and Japanese text without spaces matches only as whole runs.

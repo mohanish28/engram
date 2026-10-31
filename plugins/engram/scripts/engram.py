@@ -43,7 +43,11 @@ SECRET_PATTERNS = [(kind, re.compile(rx)) for kind, rx in (
     ("bearer-token", r"(?i:\bbearer\s+[A-Za-z0-9._~+/\-]{16,}=*)"),
     ("credential", r"(?i:[\w\-]*(?:api[ _-]?key|secret|token|passw(?:or)?d|passphrase|pwd)"
                    r"""(?:[_-]?key)?["']?\s*[:=]\s*""" + _VALUE + r")"),
-    ("credential", r"(?i:(?:api[ _-]?key|passw(?:or)?d|passphrase|pwd)\s+(?:is|was)\s+" + _VALUE + r")"),
+    ("credential", r"(?i:\b(?:api[ _-]?key|passw(?:or)?d|passphrase|pwd|pass|pin|secret)\s+(?:is|was)\s+"
+                   + _VALUE + r")"),
+    # "ssh password hunter2": a value with a digit, up to 3 words later in the same sentence.
+    ("credential", r"(?i:\b(?:passw(?:or)?d|passwd|passphrase|pwd|pass|pin|secret)s?\b"
+                   r"(?:\s+[^\s.;,!?]+){0,3}?\s+(?!v?\d+(?:\.\d+)+\b)[^\s.;,!?]*\d\S*)"),
 )]
 TOKEN = re.compile(r"[A-Za-z0-9_\-+=]{20,}")
 # Random-looking but routine in notes: full git SHAs, SHA-256 digests, UUIDs.

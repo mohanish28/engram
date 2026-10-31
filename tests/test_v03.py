@@ -1003,3 +1003,50 @@ class LauncherImportPath(Base):
                                    cwd=str(self.cwd), env=self.env, timeout=60)
                 self.assertEqual(p.returncode, 0, p.stderr)
                 self.assertFalse(marker.exists(), "module from cwd was executed")
+
+
+class ProseSecrets(Base):
+    LEAKS = {"the root pass is blue-harbor-42": "blue-harbor-42",
+             "my pin is 482913 for the vault": "482913",
+             "ssh password hunter2 on box": "hunter2",
+             "root pass is bluewhale": "bluewhale",
+             "vault secret was kingfisher": "kingfisher",
+             "the wifi passphrase here is tiger77": "tiger77",
+             "pwd for staging box: a1b2": "a1b2"}
+
+    def test_add_refuses_and_stores_nothing(self):
+        for text, value in self.LEAKS.items():
+            with self.subTest(text=text):
+                p = self.add(text)
+                self.assertNotEqual(p.returncode, 0, p.out)
+                self.assertIn("refused", p.err)
+                self.assertNotIn(value, p.out + p.err)
+        if self.db_path.exists():
+            self.assertEqual(self.sql("SELECT COUNT(*) FROM memories")[0][0], 0)
+
+    def test_old_rows_are_redacted_in_all_output(self):
+        for text, value in self.LEAKS.items():
+            i = self.saved_id(self.add("alpha bravo placeholder %d" % time.time_ns()))
+            self.sql("UPDATE memories SET text=? WHERE id=?", "alpha bravo " + text, i)
+            for out in (self.cli("review").out, self.cli("search", "alpha bravo").out,
+                        self.hook("hook-start").out, self.hook("hook-prompt", prompt="alpha bravo").out):
+                with self.subTest(text=text):
+                    self.assertNotIn(value, out)
+
+    def test_session_log_redacts_instead_of_refusing(self):
+        t = self.tmp / "t.jsonl"
+        t.write_text("\n".join(json.dumps(x) for x in [
+            {"message": {"role": "user", "content": "ssh password hunter2 on box"}},
+            {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Bash", "input": {}}] * 3}}]), encoding="utf-8")
+        self.hook("hook-capture", transcript_path=str(t), session_id="abcdefgh")
+        self.assertNotIn(b"hunter2", self.db_path.read_bytes())
+
+    def test_ordinary_engineering_notes_are_kept(self):
+        for text in ("password reset emails go through SES",
+                     "pin numpy to 1.26.4 because of the ABI break",
+                     "tests pass on python 3.12",
+                     "rotate the secret before launch. Budget is 500",
+                     "pin the base image"):
+            with self.subTest(text=text):
+                self.saved_id(self.add(text))

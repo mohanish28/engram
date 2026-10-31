@@ -186,39 +186,42 @@ class Forgetting(Base):
     def prunable(self, *args):
         return self.saved_id(self.add("--importance", "1", "--kind", "question", *args))
 
-    def test_ten_year_old_importance_1_note_with_one_hit_is_pruned(self):
+    def tier(self, note_id):
+        return self.sql("SELECT tier FROM memories WHERE id=?", note_id)[0][0]
+
+    def test_ten_year_old_importance_1_note_with_one_hit_is_demoted_not_archived(self):
         i = self.prunable("alpha obsolete thing")
         self.cli("search", "alpha")
         self.assertEqual(self.sql("SELECT access_count FROM memories WHERE id=?", i)[0][0], 1)
         self.age(i, TEN_YEARS)
         self.cli("prune")
-        self.assertEqual(self.status(i), "archived")
+        self.assertEqual((self.status(i), self.tier(i)), ("active", "cold"))
 
-    def test_access_bonus_is_capped(self):
+    def test_heavy_use_long_ago_does_not_keep_a_note_hot(self):
         i = self.prunable("alpha obsolete thing")
         self.sql("UPDATE memories SET access_count=100000 WHERE id=?", i)
         self.age(i, TEN_YEARS)
         self.cli("prune")
-        self.assertEqual(self.status(i), "archived")
+        self.assertEqual(self.tier(i), "cold")
 
-    def test_decay_uses_last_access_not_created(self):
+    def test_hotness_uses_last_access_not_created(self):
         i = self.prunable("alpha still used")
         then = time.time() - TEN_YEARS
         self.sql("UPDATE memories SET created=? WHERE id=?", then, i)
         self.cli("prune")
-        self.assertEqual(self.status(i), "active")
+        self.assertEqual(self.tier(i), "hot")
 
-    def test_decay_runs_from_old_last_access_even_when_created_is_recent(self):
+    def test_old_last_access_demotes_even_when_created_is_recent(self):
         i = self.prunable("alpha unused")
         self.age(i, TEN_YEARS, created_too=False)
         self.cli("prune")
-        self.assertEqual(self.status(i), "archived")
+        self.assertEqual(self.tier(i), "cold")
 
-    def test_importance_5_never_expires(self):
+    def test_importance_5_stays_hot(self):
         i = self.saved_id(self.add("--importance", "5", "alpha critical"))
         self.age(i, TEN_YEARS)
         self.cli("prune")
-        self.assertEqual(self.status(i), "active")
+        self.assertEqual(self.tier(i), "hot")
 
     def test_forget_nonexistent_id_fails(self):
         i = self.saved_id(self.add("alpha"))
@@ -502,14 +505,15 @@ class PlainFolderProjects(Base):
         self.assertNotIn("folder a", self.hook("hook-start", cwd=b).out)
 
 
-class Migration(Base):
-    V01_SCHEMA = """
+class Upgrade(Base):
+    """A database written by the previous release keeps working."""
+    OLD_SCHEMA = """
     CREATE TABLE memories(
       id INTEGER PRIMARY KEY, kind TEXT NOT NULL, text TEXT NOT NULL,
       project TEXT NOT NULL DEFAULT '*', importance INTEGER NOT NULL DEFAULT 3,
       created REAL NOT NULL, last_access REAL NOT NULL,
       access_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active',
-      superseded_by INTEGER);
+      superseded_by INTEGER, display TEXT);
     CREATE VIRTUAL TABLE mem_fts USING fts5(
       text, content='memories', content_rowid='id', tokenize='porter');
     CREATE TRIGGER mem_ai AFTER INSERT ON memories BEGIN
@@ -521,38 +525,35 @@ class Migration(Base):
       INSERT INTO mem_fts(rowid, text) VALUES (new.id, new.text); END;
     """
 
-    def legacy_db(self, *rows):
+    def old_db(self):
+        key = os.path.normcase(os.path.abspath(str(self.cwd))).replace("\\", "/")
         self.home.mkdir()
         c = sqlite3.connect(str(self.db_path))
-        c.executescript(self.V01_SCHEMA)
+        c.executescript(self.OLD_SCHEMA)
         now = time.time()
-        for project, text in rows:
-            c.execute("INSERT INTO memories(kind,text,project,importance,created,last_access) "
-                      "VALUES ('fact',?,?,3,?,?)", (text, project, now, now))
+        rows = [("fresh project note", key, "proj", 3, now),
+                ("stale project note", key, "proj", 3, now - TEN_YEARS),
+                ("global note kept", "*", None, 3, now)]
+        for text, project, display, imp, when in rows:
+            c.execute("INSERT INTO memories(kind,text,project,importance,created,last_access,display) "
+                      "VALUES ('fact',?,?,?,?,?,?)", (text, project, imp, when, when, display))
         c.commit()
         c.close()
 
-    def test_legacy_rows_appear_in_the_folder_they_were_named_after(self):
-        self.legacy_db(("proj", "legacy folder note"), ("*", "legacy global note"))
+    def test_rows_survive_and_get_the_right_tier(self):
+        self.old_db()
         out = self.hook("hook-start").out
-        self.assertIn("legacy folder note", out)
-        self.assertIn("legacy global note", out)
-        self.assertIn("legacy folder note", self.cli("search", "legacy").out)
+        self.assertIn("fresh project note", out)
+        self.assertIn("global note kept", out)
+        self.assertNotIn("stale project note", out)
+        self.assertIn("stale project note", self.cli("search", "stale").out)
 
-    def test_legacy_rows_are_claimed_once_not_shared_with_a_same_named_folder(self):
-        self.legacy_db(("same", "claimed note"))
-        a, b = self.tmp / "a" / "same", self.tmp / "b" / "same"
-        a.mkdir(parents=True)
-        b.mkdir(parents=True)
-        self.assertIn("claimed note", self.hook("hook-start", cwd=a).out)
-        self.assertNotIn("claimed note", self.hook("hook-start", cwd=b).out)
-        self.assertIn("claimed note", self.hook("hook-start", cwd=a).out)
-
-    def test_new_explicit_project_rows_are_not_claimed(self):
-        self.add("--project", "proj", "explicit project note")
-        self.assertNotIn("explicit project note", self.hook("hook-start").out)
-        self.assertIn("explicit project note",
-                      self.cli("search", "--project", "proj", "explicit").out)
+    def test_upgrade_runs_once_and_ids_stay_valid(self):
+        self.old_db()
+        self.cli("stats")
+        self.cli("stats")
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM memories")[0][0], 3)
+        self.assertEqual(self.cli("forget", 1).returncode, 0)
 
 
 class HookConfig(unittest.TestCase):

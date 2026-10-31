@@ -185,3 +185,146 @@ class RealPermissions(Base):
         self.add("alpha")
         self.assertEqual(os.stat(self.home).st_mode & 0o777, 0o700)
         self.assertEqual(os.stat(self.db_path).st_mode & 0o777, 0o600)
+
+
+class Tiers(Base):
+    def old_note(self, *args):
+        i = self.saved_id(self.add(*args))
+        self.age(i, 40 * DAY)
+        self.cli("prune")
+        return i
+
+    def tier(self, i):
+        return self.sql("SELECT tier FROM memories WHERE id=?", i)[0][0]
+
+    def test_recent_note_is_hot_and_31_day_old_note_is_cold(self):
+        hot = self.saved_id(self.add("alpha recent"))
+        self.age(hot, 29 * DAY)
+        cold = self.old_note("alpha old")
+        self.assertEqual((self.tier(hot), self.tier(cold)), ("hot", "cold"))
+
+    def test_decisions_and_failures_at_importance_4_stay_hot(self):
+        for kind in ("decision", "failure"):
+            with self.subTest(kind=kind):
+                i = self.old_note("--kind", kind, "--importance", "4", "%s alpha" % kind)
+                self.assertEqual(self.tier(i), "hot")
+
+    def test_decision_below_importance_4_goes_cold(self):
+        self.assertEqual(self.tier(self.old_note("--kind", "decision", "alpha choice")), "cold")
+
+    def test_demotion_deletes_nothing(self):
+        i = self.old_note("alpha old")
+        self.assertEqual(self.status(i), "active")
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM memories")[0][0], 1)
+
+    def test_hot_index_contains_only_hot_active_notes(self):
+        cold = self.old_note("alpha cold")
+        hot = self.saved_id(self.add("bravo hot"))
+        gone = self.saved_id(self.add("charlie gone"))
+        self.cli("forget", gone)
+        self.assertEqual([r[0] for r in self.sql("SELECT rowid FROM hot_fts")], [hot])
+
+    def test_hot_search_ignores_cold_notes(self):
+        self.old_note("zebra cold marker")
+        self.assertEqual(self.hook("hook-prompt", prompt="zebra cold marker").out, "")
+        self.assertNotIn("zebra", self.hook("hook-start").out)
+
+    def test_explicit_search_finds_cold_notes(self):
+        i = self.old_note("zebra cold marker")
+        self.assertIn("#%d" % i, self.cli("search", "zebra").out)
+
+    def test_clear_search_hit_promotes_a_cold_note(self):
+        i = self.old_note("zebra cold marker")
+        self.cli("search", "zebra")
+        self.assertEqual(self.tier(i), "hot")
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM hot_fts WHERE rowid=?", i)[0][0], 1)
+
+    def test_weak_search_hit_does_not_refresh_last_use(self):
+        i = self.old_note("zebra cold marker")
+        before = self.sql("SELECT last_access, access_count FROM memories WHERE id=?", i)[0]
+        out = self.cli("search", "zebra unrelated words").out
+        self.assertIn("#%d" % i, out, "still listed")
+        self.assertEqual(self.sql("SELECT last_access, access_count FROM memories WHERE id=?", i)[0], before)
+        self.assertEqual(self.tier(i), "cold")
+
+    def test_session_start_query_uses_the_hot_only_index(self):
+        self.add("alpha")
+        old = os.environ.get("ENGRAM_HOME")
+        m = load_module(self.home)
+        self.addCleanup(lambda: os.environ.pop("ENGRAM_HOME") if old is None
+                        else os.environ.__setitem__("ENGRAM_HOME", old))
+        plan = self.sql("EXPLAIN QUERY PLAN " + m.HOT_NOTES, "x", "y")
+        self.assertIn("mem_hot", " ".join(str(r) for r in plan))
+
+
+class Rollups(Base):
+    def episode(self, text, days_ago, cwd=None):
+        i = self.saved_id(self.add("placeholder %d" % time.time_ns(), cwd=cwd))
+        when = time.time() - days_ago * DAY
+        self.sql("UPDATE memories SET kind='episode', text=?, created=?, last_access=? WHERE id=?",
+                 text, when, when, i)
+        return i
+
+    def session(self, sid, prompt, days_ago, files="", cwd=None):
+        edited = "; edited 1 files (%s)" % files if files else ""
+        return self.episode('[session %s] 2026-01-01: started with "%s"; 5 tool calls%s'
+                            % (sid, prompt, edited), days_ago, cwd)
+
+    def rollup_rows(self):
+        return [r[0] for r in self.sql("SELECT text FROM memories WHERE kind='rollup' ORDER BY id")]
+
+    def test_old_episodes_roll_up_and_are_deleted(self):
+        a = self.session("aaaa", "first task", 60, "a.py")
+        b = self.session("bbbb", "second task", 60, "b.py")
+        self.cli("prune")
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM memories WHERE id IN (?,?)", a, b)[0][0], 0)
+        rows = self.rollup_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertRegex(rows[0], r"^Week of \d{4}-\d{2}-\d{2}, project proj: 2 sessions")
+        for part in ("a.py", "b.py", "first task", "second task"):
+            self.assertIn(part, rows[0])
+
+    def test_recent_episodes_are_left_alone(self):
+        i = self.session("aaaa", "recent task", 5)
+        self.cli("prune")
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM memories WHERE id=?", i)[0][0], 1)
+        self.assertEqual(self.rollup_rows(), [])
+
+    def test_summary_is_deterministic(self):
+        texts = []
+        for _ in range(2):
+            self.sql("DELETE FROM memories WHERE kind='rollup'") if self.db_path.exists() else None
+            self.session("aaaa", "one", 60, "z.py")
+            self.session("bbbb", "two", 60, "a.py")
+            self.cli("prune")
+            texts.append(self.rollup_rows()[0])
+        self.assertEqual(texts[0], texts[1])
+
+    def test_projects_get_separate_rollups(self):
+        other = self.tmp / "other"
+        other.mkdir()
+        self.session("aaaa", "here", 60)
+        self.session("bbbb", "there", 60, cwd=other)
+        self.cli("prune")
+        self.assertEqual(len(self.rollup_rows()), 2)
+
+    def test_later_episode_merges_into_the_existing_week(self):
+        self.session("aaaa", "one", 60)
+        self.cli("prune")
+        self.session("bbbb", "two", 60)
+        self.cli("prune")
+        rows = self.rollup_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertIn("2 sessions", rows[0])
+
+    def test_rollups_are_cold_and_not_injected(self):
+        self.session("aaaa", "zebra task", 60)
+        self.cli("prune")
+        self.assertEqual(self.sql("SELECT tier FROM memories WHERE kind='rollup'")[0][0], "cold")
+        self.assertEqual(self.hook("hook-prompt", prompt="zebra task").out, "")
+        self.assertIn("zebra", self.cli("search", "zebra").out)
+
+    def test_session_end_hook_rolls_up_too(self):
+        self.session("aaaa", "one", 60)
+        self.hook("hook-capture")
+        self.assertEqual(len(self.rollup_rows()), 1)

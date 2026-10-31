@@ -225,8 +225,19 @@ class Tiers(Base):
         self.assertEqual([r[0] for r in self.sql("SELECT rowid FROM hot_fts")], [hot])
 
     def test_hot_search_ignores_cold_notes(self):
+        cold = self.old_note("zebra cold marker")
+        hot = self.saved_id(self.add("zebra hot marker"))
+        old = os.environ.get("ENGRAM_HOME")
+        m = load_module(self.home)
+        self.addCleanup(lambda: os.environ.pop("ENGRAM_HOME") if old is None
+                        else os.environ.__setitem__("ENGRAM_HOME", old))
+        c = m.db()
+        self.addCleanup(c.close)
+        self.assertEqual([r["id"] for r in m.matches(c, "zebra", hot=True)], [hot])
+        self.assertCountEqual([r["id"] for r in m.matches(c, "zebra")], [cold, hot])
+
+    def test_session_start_ignores_cold_notes(self):
         self.old_note("zebra cold marker")
-        self.assertEqual(self.hook("hook-prompt", prompt="zebra cold marker").out, "")
         self.assertNotIn("zebra", self.hook("hook-start").out)
 
     def test_explicit_search_finds_cold_notes(self):
@@ -488,3 +499,135 @@ class SessionStartIndex(Base):
             self.add(w)
         lines = self.hook("hook-start").out.splitlines()
         self.assertEqual(len([x for x in lines if NOTE_LINE.match(x)]), 3)
+
+
+class Scopes(Base):
+    def setUp(self):
+        super().setUp()
+        self.other = self.tmp / "other"
+        self.other.mkdir()
+
+    def test_new_project_is_private_and_global_is_shared(self):
+        self.add("alpha note")
+        scopes = dict(self.sql("SELECT display, scope FROM projects"))
+        self.assertEqual(scopes["proj"], "private")
+        self.assertEqual(scopes["*"], "shared")
+
+    def test_scope_set_updates_project_and_cards(self):
+        i = self.saved_id(self.add("alpha note"))
+        self.assertEqual(self.cli("scope", "set", "proj", "shared").returncode, 0)
+        self.assertEqual(self.sql("SELECT scope FROM projects WHERE display='proj'")[0][0], "shared")
+        self.assertEqual(self.sql("SELECT scope FROM cards WHERE note_id=?", i)[0][0], "shared")
+        self.cli("scope", "set", "proj", "private")
+        self.assertEqual(self.sql("SELECT scope FROM cards WHERE note_id=?", i)[0][0], "private")
+
+    def test_scope_set_rejects_unknown_project_and_global(self):
+        self.add("alpha note")
+        self.assertNotEqual(self.cli("scope", "set", "nope", "shared").returncode, 0)
+        self.assertNotEqual(self.cli("scope", "set", "*", "private").returncode, 0)
+
+    def test_scope_set_rejects_ambiguous_name(self):
+        a, b = self.tmp / "a" / "same", self.tmp / "b" / "same"
+        a.mkdir(parents=True)
+        b.mkdir(parents=True)
+        self.add("alpha note", cwd=a)
+        self.add("bravo note", cwd=b)
+        self.assertNotEqual(self.cli("scope", "set", "same", "shared").returncode, 0)
+
+    def test_scope_list_shows_projects(self):
+        self.add("alpha note")
+        self.assertRegex(self.cli("scope", "list").out, r"proj\s+private")
+
+    def test_search_stays_in_current_project_by_default(self):
+        self.add("zebra elsewhere note", cwd=self.other)
+        self.cli("scope", "set", "other", "shared")
+        self.assertEqual(self.cli("search", "zebra").out, "no matches")
+
+    def test_private_project_is_searchable_when_named(self):
+        self.add("zebra elsewhere note", cwd=self.other)
+        self.assertIn("zebra", self.cli("search", "--project", "other", "zebra").out)
+
+    def test_everywhere_finds_shared_but_not_private(self):
+        self.add("zebra private note", cwd=self.other)
+        third = self.tmp / "third"
+        third.mkdir()
+        self.add("zebra shared note", cwd=third)
+        self.cli("scope", "set", "third", "shared")
+        self.add("zebra local note")
+        self.add("--global", "zebra global note")
+        out = self.cli("search", "--everywhere", "zebra").out
+        for word in ("shared", "local", "global"):
+            self.assertIn("zebra %s" % word, out)
+        self.assertNotIn("private", out)
+
+
+class Cascade(Base):
+    PROMPT = "zebra migration rollout"
+
+    def shared_project(self, text, name="other"):
+        d = self.tmp / name
+        d.mkdir(exist_ok=True)
+        i = self.saved_id(self.add(text, cwd=d))
+        self.cli("scope", "set", name, "shared")
+        return i
+
+    def prompt(self, text=None):
+        return self.hook("hook-prompt", prompt=text or self.PROMPT).out
+
+    def test_escalates_to_shared_project_labelled_with_its_source(self):
+        i = self.shared_project("zebra migration uses blue green")
+        lines = self.prompt().splitlines()
+        note = [x for x in lines if x.startswith("#%d " % i)]
+        self.assertEqual(len(note), 1, lines)
+        self.assertIn("|other|", note[0])
+
+    def test_private_project_is_never_reached(self):
+        d = self.tmp / "other"
+        d.mkdir()
+        self.add("zebra migration uses blue green", cwd=d)
+        self.assertEqual(self.prompt(), "")
+
+    def test_two_hot_matches_do_not_escalate(self):
+        self.add("zebra migration first local")
+        self.add("zebra rollout second local")
+        self.shared_project("zebra migration rollout shared elsewhere")
+        out = self.prompt()
+        self.assertEqual(len([x for x in out.splitlines() if NOTE_LINE.match(x)]), 2)
+        self.assertNotIn("elsewhere", out)
+
+    def test_one_hot_match_escalates_and_total_stays_at_three(self):
+        self.add("zebra migration first local")
+        for w in ("aa", "bb", "cc", "dd"):
+            self.shared_project("zebra migration rollout shared %s" % w)
+        notes = [x for x in self.prompt().splitlines() if NOTE_LINE.match(x)]
+        self.assertEqual(len(notes), 3)
+        self.assertIn("first local", notes[0])
+
+    def test_own_cold_note_is_reached_before_other_projects(self):
+        i = self.saved_id(self.add("zebra migration old local decision"))
+        self.age(i, 40 * DAY)
+        self.cli("prune")
+        self.shared_project("zebra migration rollout shared elsewhere")
+        lines = [x for x in self.prompt().splitlines() if NOTE_LINE.match(x)]
+        self.assertTrue(lines[0].startswith("#%d " % i), lines)
+
+    def test_one_shared_word_is_not_enough_for_another_project(self):
+        self.shared_project("zebra lives in the zoo")
+        self.assertEqual(self.prompt("zebra"), "")
+
+    def test_router_does_not_count_as_use(self):
+        i = self.shared_project("zebra migration uses blue green")
+        self.prompt()
+        self.assertEqual(self.sql("SELECT access_count FROM memories WHERE id=?", i)[0][0], 0)
+
+    def test_router_skips_forgotten_notes(self):
+        i = self.shared_project("zebra migration uses blue green")
+        self.cli("forget", i)
+        self.assertEqual(self.prompt(), "")
+
+    def test_canaries_do_not_reach_router_output(self):
+        i = self.shared_project("zebra migration note placeholder")
+        self.sql("UPDATE memories SET text=? WHERE id=?", "zebra migration " + GH, i)
+        out = self.prompt()
+        self.assertIn("#%d" % i, out)
+        self.assertNotIn("ghp_abcdef", out)

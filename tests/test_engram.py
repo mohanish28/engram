@@ -279,7 +279,7 @@ class Normalize(Base):
         self.assertTrue(lines)
         for line in lines:
             ok = NOTE_LINE.match(line) or line.startswith("[engram] Notes saved") \
-                or line.startswith("Save durable notes")
+                or line.startswith("[engram] Topics:") or line.startswith("Save durable notes")
             self.assertTrue(ok, "forged line: %r" % line)
 
     def test_note_is_one_line_on_save(self):
@@ -440,15 +440,15 @@ class PromptHook(Base):
 
 
 class SessionStart(Base):
-    def test_lists_top_five_by_importance(self):
+    def test_lists_top_three_by_importance(self):
         words = ("alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf")
         for word, imp in zip(words, (1, 2, 3, 4, 5, 5, 4)):
             self.saved_id(self.add("--importance", imp, word))
         out = self.hook("hook-start").out
         notes = [x for x in out.splitlines() if NOTE_LINE.match(x)]
-        self.assertEqual(len(notes), 5, out)
+        self.assertEqual(len(notes), 3, out)
         imps = [int(re.search(r"imp(\d)", x).group(1)) for x in notes]
-        self.assertEqual(imps, [5, 5, 4, 4, 3])
+        self.assertEqual(imps, [5, 5, 4])
 
 
 @unittest.skipUnless(shutil.which("git"), "git not available")

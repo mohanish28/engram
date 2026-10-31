@@ -328,3 +328,163 @@ class Rollups(Base):
         self.session("aaaa", "one", 60)
         self.hook("hook-capture")
         self.assertEqual(len(self.rollup_rows()), 1)
+
+
+class Topics(Base):
+    def topic(self, i):
+        return self.sql("SELECT topic FROM memories WHERE id=?", i)[0][0]
+
+    def test_near_duplicate_tag_gets_a_suggestion_and_still_saves(self):
+        self.add("--topic", "database", "alpha note")
+        p = self.add("--topic", "db", "bravo note")
+        i = self.saved_id(p)
+        self.assertEqual(self.topic(i), "db")
+        self.assertRegex(p.out, r"TOPIC: 'db' is close to existing 'database'")
+
+    def test_similar_spelling_gets_a_suggestion(self):
+        self.add("--topic", "deployment", "alpha note")
+        self.assertIn("TOPIC", self.add("--topic", "deployments", "bravo note").out)
+
+    def test_exact_and_unrelated_tags_get_no_suggestion(self):
+        self.add("--topic", "database", "alpha note")
+        self.assertNotIn("TOPIC", self.add("--topic", "database", "bravo note").out)
+        self.assertNotIn("TOPIC", self.add("--topic", "frontend", "charlie note").out)
+
+    def test_tag_is_normalized(self):
+        self.assertEqual(self.topic(self.saved_id(self.add("--topic", "Rate Limits!", "alpha"))), "rate-limits")
+
+    def test_untagged_note_adopts_existing_topic_named_in_its_text(self):
+        self.add("--topic", "postgres", "alpha note")
+        self.assertEqual(self.topic(self.saved_id(self.add("Postgres needs tuning"))), "postgres")
+
+    def test_untagged_note_defaults_to_general(self):
+        self.assertEqual(self.topic(self.saved_id(self.add("alpha note"))), "general")
+
+    def test_supersede_and_merge_keep_the_topic(self):
+        a = self.saved_id(self.add("--topic", "database", "alpha one"))
+        b = self.saved_id(self.add("--topic", "database", "bravo two"))
+        out = self.cli("supersede", a, "charlie three").out
+        c = int(re.search(r"superseded by #(\d+)", out).group(1))
+        self.assertEqual(self.topic(c), "database")
+        out = self.cli("merge", b, c, "--text", "delta four").out
+        self.assertEqual(self.topic(int(re.search(r"into #(\d+)", out).group(1))), "database")
+
+
+class Cards(Base):
+    def card(self, i):
+        rows = self.sql("SELECT key, project_id, topic, keywords, gist, tier, scope "
+                        "FROM cards WHERE note_id=?", i)
+        return rows[0] if rows else None
+
+    def fts_count(self, i):
+        return self.sql("SELECT COUNT(*) FROM cards_fts WHERE rowid=?", i)[0][0]
+
+    def test_key_is_project_and_note_id(self):
+        i = self.saved_id(self.add("alpha note"))
+        pid = self.sql("SELECT project_id FROM memories WHERE id=?", i)[0][0]
+        self.assertEqual(self.card(i)[0], "%d:%d" % (pid, i))
+
+    def test_key_is_stable_when_text_changes(self):
+        i = self.saved_id(self.add("alpha note"))
+        key = self.card(i)[0]
+        self.cli("edit", i, "--text", "completely different words")
+        self.assertEqual(self.card(i)[0], key)
+
+    def test_ids_are_not_reused_after_purge(self):
+        i = self.saved_id(self.add("alpha note"))
+        self.cli("purge", i)
+        self.assertGreater(self.saved_id(self.add("bravo note")), i)
+
+    def test_card_has_keywords_gist_topic_tier_and_private_scope(self):
+        i = self.saved_id(self.add("--topic", "database", "Chose Postgres for multi-user. Details follow here."))
+        _, _, topic, keywords, gist, tier, scope = self.card(i)
+        self.assertEqual((topic, tier, scope), ("database", "hot", "private"))
+        self.assertIn("postgres", keywords)
+        self.assertEqual(gist, "Chose Postgres for multi-user.")
+
+    def test_edit_updates_card(self):
+        i = self.saved_id(self.add("alpha note"))
+        self.cli("edit", i, "--text", "bravo words", "--topic", "newtopic")
+        self.assertEqual(self.card(i)[2], "newtopic")
+        self.assertEqual(self.card(i)[4], "bravo words")
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM cards_fts WHERE cards_fts MATCH 'bravo'")[0][0], 1)
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM cards_fts WHERE cards_fts MATCH 'alpha'")[0][0], 0)
+
+    def test_supersede_swaps_cards(self):
+        a = self.saved_id(self.add("alpha note"))
+        out = self.cli("supersede", a, "bravo note").out
+        b = int(re.search(r"superseded by #(\d+)", out).group(1))
+        self.assertIsNone(self.card(a))
+        self.assertEqual(self.fts_count(a), 0)
+        self.assertEqual(self.card(b)[4], "bravo note")
+
+    def test_merge_swaps_cards(self):
+        a = self.saved_id(self.add("alpha note"))
+        b = self.saved_id(self.add("bravo words"))
+        out = self.cli("merge", a, b, "--text", "charlie text").out
+        c = int(re.search(r"into #(\d+)", out).group(1))
+        self.assertIsNone(self.card(a))
+        self.assertIsNone(self.card(b))
+        self.assertEqual(self.card(c)[4], "charlie text")
+
+    def test_demote_and_promote_update_card_tier(self):
+        i = self.saved_id(self.add("zebra note"))
+        self.age(i, 40 * DAY)
+        self.cli("prune")
+        self.assertEqual(self.card(i)[5], "cold")
+        self.cli("search", "zebra")
+        self.assertEqual(self.card(i)[5], "hot")
+
+    def test_forget_removes_card(self):
+        i = self.saved_id(self.add("alpha note"))
+        self.cli("forget", i)
+        self.assertIsNone(self.card(i))
+        self.assertEqual(self.fts_count(i), 0)
+
+    def test_purge_removes_card_and_its_index_entry(self):
+        i = self.saved_id(self.add("zebrapurgemarker note"))
+        self.cli("purge", i)
+        self.assertIsNone(self.card(i))
+        self.assertEqual(self.fts_count(i), 0)
+        self.assertNotIn(b"zebrapurgemarker", self.db_path.read_bytes())
+
+    def test_episodes_get_no_card(self):
+        t = self.tmp / "t.jsonl"
+        t.write_text("\n".join(json.dumps(x) for x in [
+            {"message": {"role": "user", "content": "work"}},
+            {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Bash", "input": {}}] * 3}}]), encoding="utf-8")
+        self.hook("hook-capture", transcript_path=str(t), session_id="abcdefgh")
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM memories WHERE kind='episode'")[0][0], 1)
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM cards")[0][0], 0)
+
+    def test_planted_secrets_never_reach_a_card(self):
+        i = self.saved_id(self.add("alpha note"))
+        for text in SECRETS:
+            with self.subTest(text=text[:10]):
+                self.sql("UPDATE memories SET text=? WHERE id=?", "planted " + text, i)
+                self.cli("edit", i, "--topic", "retagged")
+                row = " ".join(str(x) for x in self.card(i))
+                fts = " ".join(str(x) for r in self.sql("SELECT topic, keywords, gist FROM cards_fts") for x in r)
+                for marker in MARKERS:
+                    self.assertNotIn(marker, row)
+                    self.assertNotIn(marker, fts)
+
+
+class SessionStartIndex(Base):
+    def test_topic_index_with_counts(self):
+        self.add("--topic", "database", "alpha note")
+        self.add("--topic", "database", "bravo words")
+        self.add("--topic", "frontend", "charlie text")
+        self.assertIn("[engram] Topics: database (2), frontend (1)", self.hook("hook-start").out)
+
+    def test_cold_notes_are_not_counted(self):
+        i = self.saved_id(self.add("--topic", "database", "alpha note"))
+        self.age(i, 40 * DAY)
+        self.assertNotIn("database", self.hook("hook-start").out)
+
+    def test_at_most_three_notes(self):
+        for w in ("alpha", "bravo", "charlie", "delta"):
+            self.add(w)
+        lines = self.hook("hook-start").out.splitlines()
+        self.assertEqual(len([x for x in lines if NOTE_LINE.match(x)]), 3)

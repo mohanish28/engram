@@ -749,3 +749,107 @@ class NoVectorExtras(Base):
         self.add("zebra note")
         self.assertEqual(self.cli("search", "zebra").returncode, 0)
         self.assertEqual(self.cli("index-vectors").returncode, 0)
+
+
+class Recent(Base):
+    def setUp(self):
+        super().setUp()
+        self.other = self.tmp / "other"
+        self.shared = self.tmp / "shared"
+        self.other.mkdir()
+        self.shared.mkdir()
+        self.add("local work")
+        self.add("--global", "global work")
+        self.add("private work", cwd=self.other)
+        self.add("shared work", cwd=self.shared)
+        self.cli("scope", "set", "shared", "shared")
+
+    def test_default_is_current_project_and_global(self):
+        out = self.cli("recent").out
+        self.assertIn("local work", out)
+        self.assertIn("global work", out)
+        self.assertNotIn("shared work", out)
+        self.assertNotIn("private work", out)
+
+    def test_all_adds_shared_but_never_private(self):
+        out = self.cli("recent", "--all").out
+        self.assertIn("shared work", out)
+        self.assertNotIn("private work", out)
+
+    def test_days_limits_the_window_and_order_is_newest_first(self):
+        i = self.saved_id(self.add("older work"))
+        self.age(i, 10 * DAY)
+        out = self.cli("recent", "--days", "30").out.splitlines()
+        self.assertIn("older work", out[-1])
+        self.assertNotIn("older work", self.cli("recent", "--days", "7").out)
+
+    def test_recent_output_is_redacted(self):
+        i = self.saved_id(self.add("planted row"))
+        self.sql("UPDATE memories SET text=? WHERE id=?", "planted " + GH, i)
+        self.assertNotIn("ghp_abcdef", self.cli("recent").out)
+
+
+class ScanGit(Base):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        self.git("init", "-q")
+
+    def git(self, *args, date=None):
+        env = dict(os.environ)
+        if date:
+            env.update(GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+                       + list(args), check=True, capture_output=True, env=env, timeout=30)
+
+    def commit(self, msg, days_ago=1):
+        when = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - days_ago * DAY))
+        self.git("commit", "-q", "--allow-empty", "-m", msg, date=when + "Z")
+
+    def episodes(self):
+        return [r[0] for r in self.sql("SELECT text FROM memories WHERE kind='episode'")]
+
+    def test_stores_one_line_summaries(self):
+        self.commit("Add login page\n\nLong body that must not be stored")
+        p = self.cli("scan-git", self.repo)
+        self.assertIn("1 new", p.out)
+        eps = self.episodes()
+        self.assertEqual(len(eps), 1)
+        self.assertRegex(eps[0], r"^\[commit \w{7}\] \d{4}-\d{2}-\d{2}: Add login page$")
+
+    def test_rescan_adds_nothing(self):
+        self.commit("Add login page")
+        self.cli("scan-git", self.repo)
+        self.assertIn("0 new", self.cli("scan-git", self.repo).out)
+        self.assertEqual(len(self.episodes()), 1)
+
+    def test_secret_in_commit_subject_is_redacted(self):
+        self.commit("Rotate %s now" % GH)
+        self.cli("scan-git", self.repo)
+        self.assertIn("[REDACTED]", self.episodes()[0])
+        self.assertNotIn(b"ghp_abcdef", self.db_path.read_bytes())
+
+    def test_old_commits_roll_up_and_rescan_does_not_reimport(self):
+        self.commit("Old refactor", days_ago=90)
+        self.cli("scan-git", self.repo)
+        self.assertEqual(self.episodes(), [])
+        rollup = self.sql("SELECT text FROM memories WHERE kind='rollup'")[0][0]
+        self.assertIn("1 commits", rollup)
+        self.assertIn("Old refactor", rollup)
+        self.assertIn("0 new", self.cli("scan-git", self.repo).out)
+
+    def test_new_project_stays_private(self):
+        self.commit("Add login page")
+        self.cli("scan-git", self.repo)
+        self.assertEqual(self.sql("SELECT scope FROM projects WHERE display='repo'")[0][0], "private")
+
+    def test_not_a_repo_fails_clearly(self):
+        p = self.cli("scan-git", self.cwd)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("not a git repository", p.err)
+
+    def test_empty_repo_is_fine(self):
+        p = self.cli("scan-git", self.repo)
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("0 new", p.out)

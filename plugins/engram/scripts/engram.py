@@ -243,7 +243,17 @@ def migrate_vectors(c):
     """)
 
 
-MIGRATIONS = [migrate_tiers, migrate_projects_cards, migrate_vectors]
+def migrate_commits(c):
+    # Survives roll-up, so a rescan cannot re-import commits already folded away.
+    run_sql(c, """
+    CREATE TABLE scanned_commits(
+      project_id INTEGER NOT NULL,
+      sha TEXT NOT NULL,
+      PRIMARY KEY (project_id, sha));
+    """)
+
+
+MIGRATIONS = [migrate_tiers, migrate_projects_cards, migrate_vectors, migrate_commits]
 
 
 # ---------- helpers ----------
@@ -371,10 +381,10 @@ def fts_query(s):
     return " OR ".join('"%s"' % w for w in t)
 
 
-def git(cwd, *args):
+def git(cwd, *args, timeout=3):
     try:
         p = subprocess.run(["git", "-C", cwd] + list(args), capture_output=True,
-                           encoding="utf-8", errors="replace", timeout=3)
+                           encoding="utf-8", errors="replace", timeout=timeout)
         return p.stdout.strip() if p.returncode == 0 else ""
     except Exception:
         return ""
@@ -920,6 +930,51 @@ def cmd_scope(a):
     emit("%s is now %s" % (a.project, a.value))
 
 
+def cmd_recent(a):
+    """Timeline: this project and global notes; --all adds shared projects, never private ones."""
+    c = db()
+    ids = [GLOBAL, get_project(c)[0]]
+    if a.all:
+        ids += [r["id"] for r in c.execute("SELECT id FROM projects WHERE scope='shared'")]
+    rows = c.execute(NOTE_SELECT + " WHERE m.status='active' AND m.created>=? AND m.project_id "
+                     "IN (%s) ORDER BY m.created DESC LIMIT 100" % ",".join("?" * len(ids)),
+                     [time.time() - a.days * 86400] + ids).fetchall()
+    for r in rows:
+        emit(fmt(r))
+    if not rows:
+        emit("nothing in the last %d days" % a.days)
+
+
+def cmd_scan_git(a):
+    """Opt-in: one-line commit summaries from local repos, stored as episodes."""
+    c = db()
+    failed = []
+    for path in a.paths:
+        path = os.path.abspath(path)
+        if not git(path, "rev-parse", "--git-dir"):
+            failed.append(path)
+            continue
+        project = get_project(c, path)[0]
+        new = 0
+        log = git(path, "log", "-n", str(a.limit), "--format=%H%x09%ct%x09%s", timeout=30)
+        for line in log.splitlines():
+            sha, ct, subject = (line.split("\t", 2) + ["", ""])[:3]
+            if c.execute("SELECT 1 FROM scanned_commits WHERE project_id=? AND sha=?",
+                         (project, sha)).fetchone():
+                continue
+            day = time.strftime("%Y-%m-%d", time.localtime(int(ct)))
+            i = insert(c, "episode", prepare("[commit %s] %s: %s" % (sha[:7], day, subject)),
+                       project, 1, created=float(ct))
+            retier(c, i)
+            c.execute("INSERT INTO scanned_commits(project_id, sha) VALUES (?,?)", (project, sha))
+            new += 1
+        c.commit()
+        emit("%s: %d new commits" % (path, new))
+    rollup(c)
+    if failed:
+        sys.exit("not a git repository: %s" % ", ".join(failed))
+
+
 def cmd_stats(a):
     c = db()
     for r in c.execute("SELECT kind,status,COUNT(*) n FROM memories "
@@ -1148,6 +1203,16 @@ def main():
     x.add_argument("project", nargs="?")
     x.add_argument("value", nargs="?", choices=("private", "shared"))
     x.set_defaults(f=cmd_scope)
+
+    x = s.add_parser("recent")
+    x.add_argument("--days", type=int, default=7)
+    x.add_argument("--all", action="store_true")
+    x.set_defaults(f=cmd_recent)
+
+    x = s.add_parser("scan-git")
+    x.add_argument("paths", nargs="+")
+    x.add_argument("--limit", type=int, default=200)
+    x.set_defaults(f=cmd_scan_git)
 
     x = s.add_parser("stats")
     x.set_defaults(f=cmd_stats)

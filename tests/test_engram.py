@@ -320,51 +320,48 @@ class Normalize(Base):
 
 
 class Redaction(Base):
-    def stored(self, text):
-        i = self.saved_id(self.add(text))
-        return self.sql("SELECT text FROM memories WHERE id=?", i)[0][0]
-
-    def assertHidden(self, text, *secrets):
-        s = self.stored(text)
-        self.assertIn("[REDACTED]", s)
+    """add refuses secrets; each case must leave nothing behind."""
+    def assertRefused(self, text, *secrets):
+        p = self.add(text)
+        self.assertNotEqual(p.returncode, 0, p.out)
         for secret in secrets:
-            self.assertNotIn(secret, s)
+            self.assertNotIn(secret, p.out + p.err)
+        if self.db_path.exists():
+            self.assertEqual(self.sql("SELECT COUNT(*) FROM memories")[0][0], 0)
 
     def test_ghp_token(self):
-        self.assertHidden("use ghp_abcdefghijklmnopqrstuvwxyz012345 here", "ghp_abcdef")
+        self.assertRefused("use ghp_abcdefghijklmnopqrstuvwxyz012345 here", "ghp_abcdef")
 
     def test_github_pat(self):
-        self.assertHidden("use github_pat_11ABCDEFG0abcdefghijkl_mnopqrstuv here", "11ABCDEFG0")
+        self.assertRefused("use github_pat_11ABCDEFG0abcdefghijkl_mnopqrstuv here", "11ABCDEFG0")
 
     def test_url_with_user_and_password(self):
-        s = self.stored("connect postgres://admin:hunter2@db.example.com/app now")
-        self.assertNotIn("hunter2", s)
-        self.assertNotIn("admin", s)
-        self.assertIn("db.example.com/app", s)
+        self.assertRefused("connect postgres://admin:hunter2@db.example.com/app now", "hunter2")
 
     def test_bearer_token(self):
-        self.assertHidden("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def", "eyJhbGci")
+        self.assertRefused("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def", "eyJhbGci")
 
     def test_bearer_token_without_header(self):
-        self.assertHidden("send bearer abcd1234efgh5678ijkl", "abcd1234")
+        self.assertRefused("send bearer abcd1234efgh5678ijkl", "abcd1234")
 
     def test_password_is_value(self):
-        self.assertHidden("the password is hunter2", "hunter2")
+        self.assertRefused("the password is hunter2", "hunter2")
 
     def test_api_key_colon_value(self):
-        self.assertHidden("api key: abc123", "abc123")
+        self.assertRefused("api key: abc123", "abc123")
 
     def test_quoted_value_with_spaces(self):
-        self.assertHidden('password="two words" ok', "two", "words")
+        self.assertRefused('password="two words" ok', "two words")
 
     def test_single_quoted_value_with_spaces(self):
-        self.assertHidden("secret='two words' ok", "two", "words")
+        self.assertRefused("secret='two words' ok", "two words")
 
     def test_ordinary_prose_is_kept(self):
         for text in ("risk-assessment-framework-review needs doing",
                      "bearer token auth was chosen over cookies"):
             with self.subTest(text=text):
-                self.assertEqual(self.stored(text), text)
+                i = self.saved_id(self.add(text))
+                self.assertEqual(self.sql("SELECT text FROM memories WHERE id=?", i)[0][0], text)
 
 
 class PromptHook(Base):

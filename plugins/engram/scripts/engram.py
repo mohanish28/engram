@@ -540,9 +540,9 @@ def write_card(c, note_id):
 def get_project(c, cwd=None):
     """(id, display name) of the project at cwd, registering it on first sight."""
     locator, name = identify(cwd)
-    r = c.execute("SELECT id FROM projects WHERE locator=?", (locator,)).fetchone()
+    r = c.execute("SELECT id, display FROM projects WHERE locator=?", (locator,)).fetchone()
     if r:
-        return r["id"], name
+        return r["id"], r["display"]
     i = c.execute("INSERT INTO projects(display, locator) VALUES (?,?)", (name, locator)).lastrowid
     c.commit()
     return i, name
@@ -1015,6 +1015,163 @@ def cmd_scan_git(a):
         sys.exit("not a git repository: %s" % ", ".join(failed))
 
 
+# ---------- enrollment ----------
+SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "bower_components", "vendor", "venv", ".venv", "env",
+             "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".nox", ".gradle",
+             "build", "dist", "out", "target", "bin", "obj", "coverage", "htmlcov", ".next", ".nuxt",
+             ".svelte-kit", ".turbo", ".cache", ".terraform", ".idea", ".vscode", ".claude"}
+SKIP_NAMES = {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb",
+              "poetry.lock", "pipfile.lock", "uv.lock", "cargo.lock", "gemfile.lock", "composer.lock",
+              "go.sum", "flake.lock", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".npmrc", ".pypirc",
+              ".netrc", ".htpasswd", ".git-credentials", "known_hosts", "authorized_keys"}
+SENSITIVE_EXT = (".pem", ".key", ".crt", ".cer", ".der", ".csr", ".p12", ".pfx", ".jks", ".keystore",
+                 ".ppk", ".gpg", ".asc", ".kdbx", ".tfvars", ".tfstate")
+BINARY_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".tiff", ".pdf", ".zip", ".gz",
+              ".tar", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".exe", ".msi", ".dll", ".so", ".dylib",
+              ".a", ".o", ".obj", ".lib", ".pyc", ".class", ".jar", ".war", ".wasm", ".bin", ".dat",
+              ".db", ".sqlite", ".sqlite3", ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4",
+              ".mov", ".avi", ".wav", ".docx", ".xlsx", ".pptx", ".min.js", ".min.css", ".map")
+MANIFESTS = {"package.json", "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "pipfile",
+             "cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts", "gemfile",
+             "composer.json", "makefile", "cmakelists.txt", "dockerfile", "docker-compose.yml",
+             "compose.yaml", "deno.json", "mix.exs"}
+ENTRY_POINTS = {"main", "__main__", "app", "index", "server", "cli", "manage", "lib", "program", "wsgi",
+                "asgi"}
+MAX_FILE_BYTES = 2000000
+TIERS = {"low": {"max_notes": 8, "max_chars": 40000},
+         "medium": {"max_notes": 15, "max_chars": 200000},
+         "max": {"max_notes": 30, "max_chars": 1200000}}
+PASS_CHARS = 200000
+HOT_FILES = 15
+OVERHEAD_TOKENS = 1500   # the command's own prompts
+NOTE_TOKENS = 75         # writing one note
+ESTIMATE_NOTE = "Token figures are estimates: characters / 4, plus a fixed overhead. Nothing measures real use."
+STALE_ENROLLMENT = 86400
+
+
+def skip_file(name):
+    low = name.lower()
+    return (low in SKIP_NAMES or low.startswith(".env") or low.startswith("credentials")
+            or low.startswith("secrets") or low.endswith(SENSITIVE_EXT) or low.endswith(BINARY_EXT))
+
+
+def measure(root):
+    """({relative path: characters}, total characters, files skipped). Decided from names
+    alone wherever possible: a skipped path is never opened."""
+    files, skipped = {}, 0
+    for folder, dirs, names in os.walk(root):
+        kept = [d for d in dirs if d.lower() not in SKIP_DIRS and not os.path.islink(os.path.join(folder, d))]
+        skipped += len(dirs) - len(kept)
+        dirs[:] = sorted(kept)
+        for name in sorted(names):
+            path = os.path.join(folder, name)
+            try:
+                if skip_file(name) or os.path.islink(path) or os.path.getsize(path) > MAX_FILE_BYTES:
+                    skipped += 1
+                    continue
+                with open(path, "rb") as f:
+                    raw = f.read()
+            except OSError:
+                skipped += 1
+                continue
+            if b"\0" in raw[:8192]:
+                skipped += 1
+                continue
+            files[os.path.relpath(path, root).replace("\\", "/")] = len(raw.decode("utf-8", "replace"))
+    return files, sum(files.values()), skipped
+
+
+def project_root(path):
+    """The repo root above path, or path itself."""
+    d = os.path.realpath(path)
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return os.path.abspath(path)
+        d = parent
+
+
+def within_cap(names, sizes, limit):
+    chosen, used, truncated = [], 0, False
+    for name in names:
+        if used + sizes[name] > limit:
+            truncated = True
+            continue
+        chosen.append(name)
+        used += sizes[name]
+    return chosen, used, truncated
+
+
+def plan_tiers(root, sizes):
+    def base(rel):
+        return rel.rsplit("/", 1)[-1].lower()
+
+    def depth(rel):
+        return rel.count("/")
+    docs = [f for f in sizes if depth(f) <= 1 and (base(f) in MANIFESTS or base(f).startswith("readme"))]
+    # A README or manifest at the root comes before any in subfolders.
+    docs.sort(key=lambda f: (depth(f), f))
+    entries = sorted((f for f in sizes if depth(f) <= 3 and base(f).split(".")[0] in ENTRY_POINTS),
+                     key=lambda f: (depth(f), f))
+    changes = collections.Counter(
+        line.strip() for line in
+        git(root, "log", "-n", "500", "--name-only", "--format=", timeout=30).splitlines() if line.strip())
+    hot = [f for f, n in changes.most_common() if f in sizes and n >= 2][:HOT_FILES]
+    log_chars = len(git(root, "log", "-n", "50", "--oneline", timeout=30))
+    ordered = {"low": docs, "medium": docs + entries + hot, "max": docs + entries + hot + sorted(sizes)}
+    tiers = {}
+    for name, order in ordered.items():
+        cfg = TIERS[name]
+        files, chars, truncated = within_cap(list(dict.fromkeys(order)), sizes, cfg["max_chars"])
+        tiers[name] = {"max_notes": cfg["max_notes"], "files": files, "file_count": len(files), "chars": chars,
+                       "truncated": truncated, "passes": max(1, math.ceil(chars / PASS_CHARS)),
+                       "estimated_tokens": (chars + log_chars) // 4 + OVERHEAD_TOKENS
+                       + cfg["max_notes"] * NOTE_TOKENS}
+    return tiers
+
+
+def build_plan(c, path):
+    if not os.path.isdir(path):
+        sys.exit("not a folder: %s" % path)
+    root = project_root(path)
+    locator, name = identify(root)
+    known = c.execute("SELECT id, display FROM projects WHERE locator=?", (locator,)).fetchone()
+    pid = known["id"] if known else None
+    sizes, chars, skipped = measure(root)
+    return {"display": known["display"] if known else name, "identity": locator, "root": root,
+            "known": bool(known),
+            "enrolled": False,
+            "note_count": c.execute("SELECT COUNT(*) FROM memories WHERE project_id=? AND status='active' "
+                                    "AND kind NOT IN ('episode','rollup')", (pid,)).fetchone()[0] if known else 0,
+            "files": len(sizes), "chars": chars, "skipped": skipped, "default_tier": "medium",
+            "note": ESTIMATE_NOTE, "tiers": plan_tiers(root, sizes)}
+
+
+def cmd_enroll_plan(a):
+    plan = build_plan(db(), a.path)
+    if a.json:
+        emit(json.dumps(plan))
+        return
+    emit("project:  %s" % plan["display"])
+    emit("identity: %s" % plan["identity"])
+    emit("folder:   %s" % plan["root"])
+    if plan["enrolled"]:
+        emit("status:   already enrolled, %d notes" % plan["note_count"])
+    elif plan["known"]:
+        emit("status:   known to engram but not enrolled, %d notes" % plan["note_count"])
+    else:
+        emit("status:   new to engram")
+    emit("readable: %d files, %d characters (%d paths skipped, not read)"
+         % (plan["files"], plan["chars"], plan["skipped"]))
+    emit("%-8s %6s %10s %10s %7s" % ("tier", "files", "characters", "estimate", "notes"))
+    for name, t in plan["tiers"].items():
+        emit("%-8s %6d %10d %10d %7d%s" % (name, t["file_count"], t["chars"], t["estimated_tokens"], t["max_notes"],
+                                           "  (read limit reached)" if t["truncated"] else ""))
+    emit(ESTIMATE_NOTE)
+
+
 def cmd_stats(a):
     c = db()
     for r in c.execute("SELECT kind,status,COUNT(*) n FROM memories "
@@ -1305,6 +1462,11 @@ def main():
     x.add_argument("paths", nargs="+")
     x.add_argument("--limit", type=int, default=200)
     x.set_defaults(f=cmd_scan_git)
+
+    x = s.add_parser("enroll-plan")
+    x.add_argument("path")
+    x.add_argument("--json", action="store_true")
+    x.set_defaults(f=cmd_enroll_plan)
 
     x = s.add_parser("stats")
     x.set_defaults(f=cmd_stats)

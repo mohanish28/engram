@@ -52,9 +52,25 @@ A project is identified by its git remote (ssh and https forms match), else its 
 - A private project's notes are reachable only from inside that project, or by name with `search --project NAME`.
 - `search --everywhere` and `recent --all` add shared projects, never private ones.
 
+## Enrolling a project
+
+`/engram:enroll [path] [name]` introduces a project engram has never seen. You can also say "remember this project" or "add project X to engram". Claude shows token estimates, asks you to choose a tier and a scope, reads what the tier allows, saves notes, and shows them for you to check.
+
+| Tier | Reads | Read limit | Note limit |
+|---|---|---|---|
+| low | README, manifests such as `package.json` or `pyproject.toml`, `git log` summary | 40,000 characters | 8 |
+| medium (default) | low, plus entry points and files changed at least twice in recent git history (up to 15) | 200,000 characters | 15 |
+| max | Broad read across the codebase, in passes of about 200,000 characters | 1,200,000 characters | 30 |
+
+- **Token figures are estimates:** readable characters divided by 4, plus a fixed overhead for prompts and notes. Nothing measures real use, so `stats` shows the estimate and the notes saved, never an "actual" figure.
+- **What is never read:** `.git`, `node_modules`, virtual environments, build output, binaries, lockfiles, files over 2 MB, symlinks, `.env*`, key and certificate files, and files named `credentials*` or `secrets*`. `enroll-plan` decides these from the name, so they are never opened. Claude is told to read only the plan's file list, but nothing technically stops it opening other files.
+- **Caps and safety:** notes go through the normal `add`, so the secret scanner, scopes, topics and cards all apply. `add` refuses past the tier's note limit while a run is active.
+- **Paths outside the working folder:** Claude Code may ask permission to read them, or you can open Claude Code in that folder instead. If a read is refused, the flow stops and doesn't work around it.
+- **Enrollment records** hold the tier, estimate, note count, times and status, never note text. New projects start private.
+
 ## Commands
 
-`/engram:remember <text>` · `/engram:recall <words>` · `/engram:consolidate` · `/engram:forget <id>`
+`/engram:remember <text>` · `/engram:recall <words>` · `/engram:consolidate` · `/engram:forget <id>` · `/engram:enroll [path] [name]`
 
 CLI: `sh plugins/engram/scripts/engram.sh <command>`
 
@@ -70,6 +86,8 @@ CLI: `sh plugins/engram/scripts/engram.sh <command>`
 | `prune [--dry-run]` | Demote stale notes and roll up old session logs. Also runs from the hooks |
 | `review`, `stats` | Consolidation view; note counts and injected characters per hook and session |
 | `index-vectors` | Optional: embed cards |
+| `enroll-plan <path> [--json]` | Measure a project and estimate tokens per tier. Registers nothing |
+| `enroll-start <path> --tier T [--name N]`, `enroll-finish <path> --notes-saved N` | Open and close an enrollment run |
 
 ## Secret handling
 
@@ -116,6 +134,12 @@ Windows 11, Python 3.12, through the real launcher, using `python tests/bench_ho
 
 ## Known limits
 
+- **Enrollment notes are Claude's interpretation of code.** They can be wrong, so check each one.
+- **Reasons are not recoverable from code.** Why a decision was made usually lives in your head. Add it with `/engram:remember`.
+- **Large repos on max may need several passes,** and files past the read limit are left out. More reading gives more guessed notes, not better ones.
+- **Enrollment estimates can be well off.** Characters divided by 4 is only a rule of thumb, and the estimate doesn't include Claude re-reading its context.
+- **Enrollment limits.** The note cap counts `add` only, so `supersede` and `--global` notes aren't capped. A run left open by a crash keeps capping that project for up to a day, or until `enroll-start` runs again. The reported note count is ignored in favour of the count engram kept.
+- **Sensitive files are spotted by name.** A secret in an ordinary-looking file such as `config.py` can still be read by Claude. The scanner refuses it on save only if it recognises it.
 - **Only run on Windows so far.** POSIX permission tests are skipped there, macOS and Linux are untested, and only Python 3.12 has been run.
 - **Entropy false positives.** Long camelCase names with a digit, and other random-looking IDs, can be refused. Reword the note, since there is no override.
 - **Entropy false negatives.** A hex secret of exactly 40 or 64 characters, or a secret shaped like a UUID, gets through.

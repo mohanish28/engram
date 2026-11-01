@@ -356,3 +356,23 @@ class Enrollment(Repo):
         self.start("max", path=b)
         self.assertEqual(self.sql("SELECT COUNT(*) FROM projects WHERE display='same'")[0][0], 2)
         self.assertEqual([r[4] for r in self.rows()], ["active", "active"])
+
+
+class CommandAndSkill(unittest.TestCase):
+    def test_enroll_command_covers_the_required_steps(self):
+        text = (PLUGIN / "commands" / "enroll.md").read_text(encoding="utf-8")
+        for part in ("enroll-plan", "enroll-start", "enroll-finish", "review", "--project", "estimates",
+                     "low", "medium", "max", "private", "shared", "second", "permission", ".env",
+                     "/engram:remember", "purge", "supersede", "evidence"):
+            self.assertIn(part, text, part)
+        self.assertLess(text.index("enroll-plan"), text.index("enroll-start"))
+        self.assertLess(text.index("enroll-start"), text.index("enroll-finish"))
+
+    def test_skill_triggers_on_natural_phrases(self):
+        head = (PLUGIN / "skills" / "engram" / "SKILL.md").read_text(encoding="utf-8").split("---")[1]
+        for phrase in ("remember this project", "enroll a project", "add project"):
+            self.assertIn(phrase, head)
+
+    def test_skill_starts_the_flow_rather_than_ad_hoc_notes(self):
+        body = (PLUGIN / "skills" / "engram" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("/engram:enroll", body)

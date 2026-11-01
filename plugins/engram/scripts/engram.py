@@ -266,8 +266,25 @@ def migrate_injections(c):
     """)
 
 
+def migrate_enrollments(c):
+    # Counts and estimates only. Note text must never be written here.
+    run_sql(c, """
+    CREATE TABLE enrollments(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      tier TEXT NOT NULL,
+      max_notes INTEGER NOT NULL,
+      estimated_tokens INTEGER NOT NULL,
+      notes_saved INTEGER NOT NULL DEFAULT 0,
+      started REAL NOT NULL,
+      finished REAL,
+      status TEXT NOT NULL DEFAULT 'active');
+    CREATE INDEX enrollment_active ON enrollments(project_id) WHERE status='active';
+    """)
+
+
 MIGRATIONS = [migrate_tiers, migrate_projects_cards, migrate_vectors, migrate_commits,
-              migrate_injections]
+              migrate_injections, migrate_enrollments]
 
 
 # ---------- helpers ----------
@@ -670,6 +687,17 @@ def require_ids(c, ids):
 
 
 # ---------- commands ----------
+def active_enrollment(c, project_id):
+    """This project's open run. A run left open by a crashed session stops capping after a day."""
+    run = c.execute("SELECT * FROM enrollments WHERE project_id=? AND status='active'",
+                    (project_id,)).fetchone()
+    if run and time.time() - run["started"] > STALE_ENROLLMENT:
+        c.execute("UPDATE enrollments SET status='abandoned' WHERE id=?", (run["id"],))
+        c.commit()
+        return None
+    return run
+
+
 def cmd_add(a):
     text = note_text(" ".join(a.text))
     c = db()
@@ -688,8 +716,14 @@ def cmd_add(a):
         c.commit()
         emit("duplicate of #%d: reinforced instead of adding" % dup["id"])
         return
+    run = active_enrollment(c, project)
+    if run and run["notes_saved"] >= run["max_notes"]:
+        sys.exit("refused: enrollment note cap reached (%d for tier %s). Nothing was saved. Keep the "
+                 "best notes, then run enroll-finish." % (run["max_notes"], run["tier"]))
     topic, near, count = choose_topic(c, project, text, a.topic)
     i = insert(c, a.kind, text, project, a.importance, topic)
+    if run:
+        c.execute("UPDATE enrollments SET notes_saved=notes_saved+1 WHERE id=?", (run["id"],))
     c.commit()
     emit("saved #%d" % i)
     if near:
@@ -1142,7 +1176,8 @@ def build_plan(c, path):
     sizes, chars, skipped = measure(root)
     return {"display": known["display"] if known else name, "identity": locator, "root": root,
             "known": bool(known),
-            "enrolled": False,
+            "enrolled": bool(known and c.execute("SELECT 1 FROM enrollments WHERE project_id=? AND "
+                                                 "status='finished'", (pid,)).fetchone()),
             "note_count": c.execute("SELECT COUNT(*) FROM memories WHERE project_id=? AND status='active' "
                                     "AND kind NOT IN ('episode','rollup')", (pid,)).fetchone()[0] if known else 0,
             "files": len(sizes), "chars": chars, "skipped": skipped, "default_tier": "medium",
@@ -1172,6 +1207,40 @@ def cmd_enroll_plan(a):
     emit(ESTIMATE_NOTE)
 
 
+def cmd_enroll_start(a):
+    c = db()
+    plan = build_plan(c, a.path)
+    project = get_project(c, plan["root"])[0]
+    if a.name:
+        c.execute("UPDATE projects SET display=? WHERE id=?", (normalize(a.name)[:80], project))
+    c.execute("UPDATE enrollments SET status='abandoned' WHERE project_id=? AND status='active'", (project,))
+    tier = plan["tiers"][a.tier]
+    run = c.execute("INSERT INTO enrollments(project_id,tier,max_notes,estimated_tokens,started) "
+                    "VALUES (?,?,?,?,?)", (project, a.tier, tier["max_notes"], tier["estimated_tokens"],
+                                           time.time())).lastrowid
+    c.commit()
+    emit("enrollment #%d started: tier %s, up to %d notes, about %d tokens (estimate)"
+         % (run, a.tier, tier["max_notes"], tier["estimated_tokens"]))
+    emit("save notes with: add --project %s" % sh_quote(plan["identity"]))
+
+
+def cmd_enroll_finish(a):
+    c = db()
+    if not os.path.isdir(a.path):
+        sys.exit("not a folder: %s" % a.path)
+    r = c.execute("SELECT id FROM projects WHERE locator=?", (identify(project_root(a.path))[0],)).fetchone()
+    run = active_enrollment(c, r["id"]) if r else None
+    if not run:
+        sys.exit("no active enrollment for %s" % a.path)
+    c.execute("UPDATE enrollments SET status='finished', finished=? WHERE id=?", (time.time(), run["id"]))
+    c.commit()
+    if a.notes_saved != run["notes_saved"]:
+        emit("reported %d notes but engram counted %d; recording what it counted"
+             % (a.notes_saved, run["notes_saved"]))
+    emit("enrollment #%d finished: tier %s, %d notes saved, about %d tokens (estimate)"
+         % (run["id"], run["tier"], run["notes_saved"], run["estimated_tokens"]))
+
+
 def cmd_stats(a):
     c = db()
     for r in c.execute("SELECT kind,status,COUNT(*) n FROM memories "
@@ -1185,6 +1254,10 @@ def cmd_stats(a):
     for r in c.execute("SELECT session_id, COUNT(*) n, SUM(chars) total FROM injections "
                        "GROUP BY session_id ORDER BY MAX(id) DESC LIMIT 20"):
         emit("%-38s %5d %8d" % (r["session_id"], r["n"], r["total"]))
+    emit("\nenrollments (tier, estimated tokens, notes saved, status):")
+    for r in c.execute("SELECT p.display, e.tier, e.estimated_tokens, e.notes_saved, e.status FROM enrollments e "
+                       "JOIN projects p ON p.id=e.project_id ORDER BY e.id DESC LIMIT 20"):
+        emit("%-24s %-7s %9d %6d %s" % (r["display"], r["tier"], r["estimated_tokens"], r["notes_saved"], r["status"]))
 
 
 # ---------- hooks (must never fail loudly) ----------
@@ -1467,6 +1540,17 @@ def main():
     x.add_argument("path")
     x.add_argument("--json", action="store_true")
     x.set_defaults(f=cmd_enroll_plan)
+
+    x = s.add_parser("enroll-start")
+    x.add_argument("path")
+    x.add_argument("--tier", choices=tuple(TIERS), default="medium")
+    x.add_argument("--name")
+    x.set_defaults(f=cmd_enroll_start)
+
+    x = s.add_parser("enroll-finish")
+    x.add_argument("path")
+    x.add_argument("--notes-saved", type=int, required=True)
+    x.set_defaults(f=cmd_enroll_finish)
 
     x = s.add_parser("stats")
     x.set_defaults(f=cmd_stats)

@@ -188,3 +188,171 @@ class SkippedFilesAreNeverOpened(InProcess, Repo):
             for banned in (".env", ".pem", ".key", "id_rsa", "credentials", "lock", "node_modules",
                            "venv", "dist", "logo.png"):
                 self.assertNotIn(banned, os.path.relpath(path, str(self.proj)))
+
+
+class Enrollment(Repo):
+    WORDS = ("alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet")
+
+    def start(self, tier="low", path=None, **kw):
+        args = ["enroll-start", path or self.proj, "--tier", tier]
+        if kw.get("name"):
+            args += ["--name", kw["name"]]
+        p = self.cli(*args)
+        self.assertEqual(p.returncode, 0, p.err)
+        return p
+
+    def locator(self):
+        return self.plan()["identity"]
+
+    def save(self, text):
+        return self.cli("add", "--project", self.locator(), "--topic", "general", text)
+
+    def rows(self):
+        return self.sql("SELECT tier, max_notes, estimated_tokens, notes_saved, status FROM enrollments ORDER BY id")
+
+    def test_start_registers_private_project_and_record(self):
+        self.populate()
+        self.start("medium")
+        self.assertEqual(self.sql("SELECT display, scope FROM projects WHERE id<>0"), [("target", "private")])
+        (tier, cap, est, saved, status), = self.rows()
+        self.assertEqual((tier, cap, saved, status), ("medium", 15, 0, "active"))
+        self.assertEqual(est, self.plan()["tiers"]["medium"]["estimated_tokens"])
+
+    def test_start_uses_a_custom_display_name(self):
+        self.start(name="My Project")
+        self.assertEqual(self.sql("SELECT display FROM projects WHERE id<>0")[0][0], "My Project")
+        self.assertEqual(self.plan()["display"], "My Project")
+
+    def test_start_keeps_an_existing_shared_scope(self):
+        self.start()
+        self.cli("enroll-finish", self.proj, "--notes-saved", 0)
+        self.cli("scope", "set", self.locator(), "shared")
+        self.start()
+        self.assertEqual(self.sql("SELECT scope FROM projects WHERE id<>0")[0][0], "shared")
+
+    def test_add_refuses_past_the_cap_with_a_clear_message(self):
+        self.start("low")
+        for w in self.WORDS[:8]:
+            self.saved_id(self.save(w))
+        p = self.save(self.WORDS[8])
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("refused", p.err)
+        self.assertIn("cap", p.err)
+        self.assertIn("8", p.err)
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM memories")[0][0], 8)
+        self.assertEqual(self.rows()[0][3], 8)
+
+    def test_caps_for_each_tier(self):
+        for tier, cap in (("low", 8), ("medium", 15), ("max", 30)):
+            with self.subTest(tier=tier):
+                self.start(tier)
+                self.assertEqual(self.rows()[-1][1], cap)
+
+    def test_duplicates_and_refused_secrets_do_not_use_up_the_cap(self):
+        self.start("low")
+        self.saved_id(self.save("alpha"))
+        self.assertIn("duplicate", self.save("alpha").out)
+        self.assertNotEqual(self.save("ssh password hunter2 on box").returncode, 0)
+        self.assertEqual(self.rows()[0][3], 1)
+
+    def test_planted_secret_in_a_readme_is_refused_when_saved(self):
+        line = "Deploy with password %s on the box" % SECRET_VALUE
+        write(self.proj, "README.md", line + "\n")
+        self.start("low")
+        p = self.save(line)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("refused", p.err)
+        self.assertNotIn(SECRET_VALUE, p.out + p.err)
+        self.assertNotIn(SECRET_VALUE.encode(), self.db_path.read_bytes())
+
+    def test_add_from_inside_the_project_is_capped_too(self):
+        self.start("low")
+        for w in self.WORDS[:8]:
+            self.saved_id(self.save(w))
+        self.assertNotEqual(self.add(self.WORDS[8], cwd=self.proj).returncode, 0)
+
+    def test_other_projects_and_global_notes_are_not_capped(self):
+        self.start("low")
+        for w in self.WORDS[:8]:
+            self.saved_id(self.save(w))
+        self.saved_id(self.add("note in another project"))
+        self.saved_id(self.add("--global", "global note"))
+
+    def test_finish_closes_the_run_and_lifts_the_cap(self):
+        self.start("low")
+        for w in self.WORDS[:8]:
+            self.saved_id(self.save(w))
+        p = self.cli("enroll-finish", self.proj, "--notes-saved", 8)
+        self.assertEqual(p.returncode, 0, p.err)
+        self.assertEqual(self.rows()[0][3:], (8, "finished"))
+        self.saved_id(self.save(self.WORDS[8]))
+        self.assertEqual(self.rows()[0][3], 8, "later notes are not part of the run")
+
+    def test_finish_records_the_cli_count_and_flags_a_wrong_report(self):
+        self.start("low")
+        self.saved_id(self.save("alpha"))
+        p = self.cli("enroll-finish", self.proj, "--notes-saved", 5)
+        self.assertEqual(self.rows()[0][3], 1)
+        self.assertIn("counted 1", p.out)
+
+    def test_finish_without_an_active_run_fails(self):
+        p = self.cli("enroll-finish", self.proj, "--notes-saved", 0)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("no active enrollment", p.err)
+
+    def test_restarting_abandons_the_previous_run(self):
+        self.start("low")
+        self.start("medium")
+        self.assertEqual([r[4] for r in self.rows()], ["abandoned", "active"])
+
+    def test_a_stale_run_stops_capping_after_a_day(self):
+        self.start("low")
+        for w in self.WORDS[:8]:
+            self.saved_id(self.save(w))
+        self.sql("UPDATE enrollments SET started=?", time.time() - 2 * 86400)
+        self.saved_id(self.save(self.WORDS[8]))
+        self.assertEqual(self.rows()[0][4], "abandoned")
+
+    def test_record_contains_no_note_text(self):
+        self.start("low")
+        self.saved_id(self.save("zebraprivatemarker decision"))
+        self.cli("enroll-finish", self.proj, "--notes-saved", 1)
+        cols = [r[1] for r in self.sql("PRAGMA table_info(enrollments)")]
+        self.assertCountEqual(cols, ["id", "project_id", "tier", "max_notes", "estimated_tokens",
+                                     "notes_saved", "started", "finished", "status"])
+        for row in self.sql("SELECT * FROM enrollments"):
+            self.assertNotIn("zebraprivatemarker", " ".join(str(x) for x in row))
+
+    def test_plan_reports_already_enrolled_and_note_count(self):
+        self.start("low")
+        self.saved_id(self.save("alpha"))
+        self.saved_id(self.save("bravo"))
+        self.cli("enroll-finish", self.proj, "--notes-saved", 2)
+        plan = self.plan()
+        self.assertEqual((plan["known"], plan["enrolled"], plan["note_count"]), (True, True, 2))
+        self.assertIn("already enrolled", self.cli("enroll-plan", self.proj).out)
+
+    def test_known_project_that_was_never_enrolled(self):
+        self.saved_id(self.add("alpha", cwd=self.proj))
+        plan = self.plan()
+        self.assertEqual((plan["known"], plan["enrolled"], plan["note_count"]), (True, False, 1))
+
+    def test_stats_shows_tier_estimate_and_notes_saved_only(self):
+        self.populate()
+        self.start("low")
+        est = self.rows()[0][2]
+        self.saved_id(self.save("alpha"))
+        self.cli("enroll-finish", self.proj, "--notes-saved", 1)
+        out = self.cli("stats").out
+        self.assertRegex(out, r"target\s+low\s+%d\s+1\s+finished" % est)
+        self.assertIn("estimated", out)
+        self.assertNotIn("actual", out)
+
+    def test_same_named_folders_get_separate_projects_and_runs(self):
+        a, b = self.tmp / "a" / "same", self.tmp / "b" / "same"
+        a.mkdir(parents=True)
+        b.mkdir(parents=True)
+        self.start("low", path=a)
+        self.start("max", path=b)
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM projects WHERE display='same'")[0][0], 2)
+        self.assertEqual([r[4] for r in self.rows()], ["active", "active"])
